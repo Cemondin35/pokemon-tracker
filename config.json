@@ -5,12 +5,6 @@
 
   "sites": [
 
-    {
-      "name": "Gadget Man",
-      "platform": "prestashop",
-      "url": "https://gadgetman.ie/339-pokemon-ireland",
-      "base_url": "https://gadgetman.ie"
-    },
 
     {
       "name": "Finnegan's Corner",

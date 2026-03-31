@@ -1,0 +1,133 @@
+{
+  "telegram_token": "BURAYA_YENİ_TOKEN_YAZ",
+  "telegram_chat_id": "BURAYA_CHAT_ID_YAZ",
+  "check_interval_minutes": 15,
+
+  "sites": [
+
+    {
+      "name": "Gadget Man",
+      "platform": "prestashop",
+      "url": "https://gadgetman.ie/339-pokemon-ireland",
+      "base_url": "https://gadgetman.ie"
+    },
+
+    {
+      "name": "Finnegan's Corner",
+      "platform": "bigcommerce",
+      "url": "https://finneganscorner.com/pokemon/",
+      "base_url": "https://finneganscorner.com"
+    },
+
+    {
+      "name": "Toys Direct",
+      "platform": "shopify",
+      "base_url": "https://toysdirect.ie",
+      "collection_handle": "pokemon"
+    },
+
+    {
+      "name": "Eire Hobbies",
+      "platform": "shopify",
+      "base_url": "https://eirehobbies.com",
+      "collection_handle": "pokemon"
+    },
+
+    {
+      "name": "Discarded",
+      "platform": "shopify",
+      "base_url": "https://discarded.ie",
+      "collection_handle": "pokemon"
+    },
+
+    {
+      "name": "Art N Hobby",
+      "platform": "shopify",
+      "base_url": "https://www.artnhobby.ie",
+      "collection_handle": "pokemon"
+    },
+
+    {
+      "name": "Murphy's Toymaster",
+      "platform": "woocommerce",
+      "url": "https://murphystoymaster.ie/product-category/toys/models-hobbies/trading-cards/",
+      "base_url": "https://murphystoymaster.ie"
+    },
+
+    {
+      "name": "McGillicuddy's Toyshop",
+      "platform": "shopify",
+      "base_url": "https://mcgillicuddystoyshop.ie",
+      "collection_handle": "pokemon"
+    },
+
+    {
+      "name": "Toy Corner",
+      "platform": "shopify",
+      "base_url": "https://toycorner.ie",
+      "collection_handle": "pokemon-tcg"
+    },
+
+    {
+      "name": "O'Connor Toys",
+      "platform": "woocommerce",
+      "url": "https://oconnortoys.ie/product-category/pokemon/",
+      "base_url": "https://oconnortoys.ie"
+    },
+
+    {
+      "name": "Totally Toys",
+      "platform": "shopify",
+      "base_url": "https://totallytoys.ie",
+      "collection_handle": "pokemon"
+    },
+
+    {
+      "name": "Toy Town",
+      "platform": "shopify",
+      "base_url": "https://www.toytown.ie",
+      "collection_handle": "pokemon"
+    },
+
+    {
+      "name": "Home Value Dingle",
+      "platform": "shopify",
+      "base_url": "https://homevaluedingle.ie",
+      "collection_handle": "all",
+      "notes": "Bu site tüm ürünleri listeliyor, Pokemon filtresi URL'de yapılıyor — genel scraping daha iyi olabilir"
+    },
+
+    {
+      "name": "Beattys",
+      "platform": "shopify",
+      "base_url": "https://www.beattys.ie",
+      "collection_handle": "pokemon"
+    },
+
+    {
+      "name": "Oryx",
+      "platform": "shopify",
+      "base_url": "https://oryx.ie",
+      "collection_handle": "pokemon-sealed-product"
+    },
+
+    {
+      "name": "Toyful",
+      "platform": "shopify",
+      "base_url": "https://toyful.ie",
+      "collection_handle": "pokemon"
+    },
+
+    {
+      "name": "Easons",
+      "platform": "generic",
+      "url": "https://www.easons.com/custom-catalog/gift-categories/games-and-toys/pokemon/pokemon-cards",
+      "base_url": "https://www.easons.com",
+      "product_selector": ".product-item, .product-tile, [data-product-id]",
+      "name_selector": ".product-name, .product-title, h2",
+      "price_selector": ".price, .product-price",
+      "soldout_text": "Out of Stock"
+    }
+
+  ]
+}

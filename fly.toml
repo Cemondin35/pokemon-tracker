@@ -1,0 +1,15 @@
+app = "pokemon-tracker"
+primary_region = "lhr"
+
+[build]
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[processes]
+  worker = "python tracker.py"
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

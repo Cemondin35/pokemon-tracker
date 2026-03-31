@@ -5,7 +5,17 @@
 
   "sites": [
 
-
+    {
+    "name": "Gadget Man",
+    "platform": "generic",
+    "url": "https://gadgetman.ie/339-pokemon-ireland",
+    "base_url": "https://gadgetman.ie",
+    "product_selector": "#products .js-product-miniature",
+    "name_selector": ".product-title a",
+    "price_selector": ".price",
+    "soldout_text": "Out of stock"
+    },
+    
     {
       "name": "Finnegan's Corner",
       "platform": "bigcommerce",

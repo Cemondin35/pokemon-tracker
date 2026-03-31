@@ -355,13 +355,6 @@ async def main():
         await asyncio.sleep(interval * 60)
 
 
-if __name__ == "__main__":
-    # Web sunucusunu arka planda başlat (Render için)
-    t = threading.Thread(target=start_web_server, daemon=True)
-    t.start()
-    asyncio.run(main())
-
-
 # ── Render için basit web sunucusu (uyumasın diye) ────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -376,3 +369,10 @@ def start_web_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     log.info(f"Web sunucusu port {port} üzerinde başladı")
     server.serve_forever()
+
+
+if __name__ == "__main__":
+    # Web sunucusunu arka planda başlat (Render için)
+    t = threading.Thread(target=start_web_server, daemon=True)
+    t.start()
+    asyncio.run(main())

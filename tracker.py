@@ -10,6 +10,8 @@ import json
 import logging
 import hashlib
 import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
 
@@ -354,4 +356,23 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Web sunucusunu arka planda başlat (Render için)
+    t = threading.Thread(target=start_web_server, daemon=True)
+    t.start()
     asyncio.run(main())
+
+
+# ── Render için basit web sunucusu (uyumasın diye) ────────────────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Pokemon Tracker is running!")
+    def log_message(self, format, *args):
+        pass  # HTTP loglarını sustur
+
+def start_web_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    log.info(f"Web sunucusu port {port} üzerinde başladı")
+    server.serve_forever()

@@ -63,10 +63,13 @@ EBAY_CLIENT_ID = os.environ.get("EBAY_CLIENT_ID", "")
 EBAY_CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET", "")
 EBAY_ENVIRONMENT = os.environ.get("EBAY_ENVIRONMENT", "PRODUCTION")
 
-AUTO_SCAN_INTERVAL_HOURS = int(os.environ.get("AUTO_SCAN_INTERVAL_HOURS", "6"))
-AUTO_SCAN_SET_COUNT = int(os.environ.get("AUTO_SCAN_SET_COUNT", "3"))
-
 WATCHLIST_SETS = [s.strip() for s in os.environ.get("WATCHLIST_SETS", "").split(",") if s.strip()]
+
+BOT_SETTINGS = {
+    "interval_hours": int(os.environ.get("AUTO_SCAN_INTERVAL_HOURS", "6")),
+    "max_sets": int(os.environ.get("AUTO_SCAN_SET_COUNT", "5")),
+    "series": ["Mega Evolution", "Scarlet & Violet", "Sword & Shield"],
+}
 
 STATE_FILE = "arbitrage_state.json"
 RESULTS_FILE = "arbitrage_results.json"
@@ -1043,15 +1046,17 @@ class ArbitrageEngine:
 
             rows.append((display_name, short_rarity, cm_str, ebay_str, profit_str, profitable))
 
-        NW = 14
+        NW = 15
+        RW = 3
         def _fmt_row(name, rar, cm_s, eb_s, pr_s):
             esc = html_mod.escape(name)
             if len(esc) > NW:
                 esc = esc[:NW]
-            return f"{esc:<{NW}}|{rar:^4}|{cm_s:>5}|{eb_s:>5}|{pr_s:>5}"
+            r = rar[:RW]
+            return f"{esc:<{NW}}|{r:>{RW}}|{cm_s:>5}|{eb_s:>5}|{pr_s:>5}"
 
-        hdr = f"{'Kart':<{NW}}|{'R':^4}|{'CM':>5}|{'eB':>5}|{'Kar':>5}"
-        sep = "-" * NW + "+" + "-" * 4 + "+" + "-" * 5 + "+" + "-" * 5 + "+" + "-" * 5
+        hdr = f"{'Kart':<{NW}}|{'R':>{RW}}|{'CM':>5}|{'eB':>5}|{'Kar':>5}"
+        sep = "-" * NW + "+" + "-" * RW + "+" + "-" * 5 + "+" + "-" * 5 + "+" + "-" * 5
 
         green_rows = [r for r in rows if r[5] is True]
         red_rows = [r for r in rows if r[5] is False]
@@ -1059,13 +1064,13 @@ class ArbitrageEngine:
 
         messages = []
 
-        def _build_section(section_rows, limit=3800):
+        def _build_table(section_rows, max_msg=3600):
             lines = []
             cur_len = 0
             chunks = []
             for name, rar, cm_s, eb_s, pr_s, _ in section_rows:
                 line = _fmt_row(name, rar, cm_s, eb_s, pr_s)
-                if cur_len + len(line) + len(hdr) + len(sep) + 30 > limit and lines:
+                if cur_len + len(line) + len(hdr) + len(sep) + 30 > max_msg and lines:
                     chunks.append("<pre>" + "\n".join([hdr, sep] + lines) + "</pre>")
                     lines = []
                     cur_len = 0
@@ -1075,30 +1080,35 @@ class ArbitrageEngine:
                 chunks.append("<pre>" + "\n".join([hdr, sep] + lines) + "</pre>")
             return chunks
 
-        title = f"📊 {set_name}\n"
+        title = f"📊 <b>{html_mod.escape(set_name)}</b>\n\n"
 
         if green_rows:
-            green_chunks = _build_section(green_rows)
-            green_chunks[0] = title + f"🟢 Karli ({len(green_rows)}):\n" + green_chunks[0]
-            messages.extend(green_chunks)
+            green_tables = _build_table(green_rows)
+            first = title + f"🟢 <b>KARLI ({len(green_rows)})</b>\n" + green_tables[0]
+            messages.append(first)
+            messages.extend(green_tables[1:])
+            title = ""
 
         if red_rows:
-            red_chunks = _build_section(red_rows)
-            prefix = "" if messages else title
-            red_chunks[0] = prefix + f"🔴 Zararli ({len(red_rows)}):\n" + red_chunks[0]
-            messages.extend(red_chunks)
+            red_tables = _build_table(red_rows)
+            prefix = title or ""
+            first = prefix + f"🔴 Zararli ({len(red_rows)})\n" + red_tables[0]
+            messages.append(first)
+            messages.extend(red_tables[1:])
+            title = ""
 
         if nodata_rows:
-            nd_chunks = _build_section(nodata_rows)
-            prefix = "" if messages else title
-            nd_chunks[0] = prefix + f"⚪ eBay yok ({len(nodata_rows)}):\n" + nd_chunks[0]
-            messages.extend(nd_chunks)
+            nd_tables = _build_table(nodata_rows)
+            prefix = title or ""
+            first = prefix + f"⚪ eBay yok ({len(nodata_rows)})\n" + nd_tables[0]
+            messages.append(first)
+            messages.extend(nd_tables[1:])
 
         if not messages:
-            messages = [f"❌ {set_name}: Sonuç bulunamadı."]
+            messages = [f"❌ {set_name}: Sonuc bulunamadi."]
 
         total_shown = len(rows)
-        footer = f"\n📈 {total_shown} kart | Fiyatlar EUR"
+        footer = f"\n\n📈 {total_shown} kart | Fiyatlar EUR"
         footer += f"\nCM: %5 + €1.50 kesinti | GBP→EUR x{GBP_TO_EUR}"
         if not ebay_available:
             footer += "\n⚠️ eBay API ayarlanmamis"
@@ -1108,7 +1118,7 @@ class ArbitrageEngine:
 
     @staticmethod
     def _short_rarity(rarity: str) -> str:
-        r = rarity.lower()
+        r = rarity.lower().strip()
         if "special illustration" in r or r == "sir":
             return "SIR"
         if "illustration" in r or r == "ir":
@@ -1130,10 +1140,12 @@ class ArbitrageEngine:
         if "crown" in r:
             return "CR"
         if "gold" in r:
-            return "GOLD"
+            return "GLD"
         if "immersive" in r:
             return "IMR"
-        return rarity[:4].upper()
+        if "shiny" in r or r == "shiny rare":
+            return "SHN"
+        return rarity[:3].upper()
 
     async def analyze_set(self, set_code: str, force: bool = False) -> list[CardPrice]:
         if not force and self.state.is_set_recent(set_code):
@@ -1549,39 +1561,106 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                         d3.append(f"⚠️ eBay API anahtarları ayarlanmamış")
                     await engine.telegram.send_text("🔧 4/4 eBay API\n\n" + "\n".join(d3), chat_id)
 
+                elif text.startswith("/settings"):
+                    parts = text.split(maxsplit=2)
+                    if len(parts) < 2:
+                        series_list = ", ".join(BOT_SETTINGS['series']) if BOT_SETTINGS['series'] else "Tum seriler"
+                        await engine.telegram.send_text(
+                            f"⚙️ Ayarlar\n\n"
+                            f"Otomatik tarama: Her {BOT_SETTINGS['interval_hours']} saat\n"
+                            f"Taranacak seriler: {series_list}\n"
+                            f"Her seride max set: {BOT_SETTINGS['max_sets']}\n\n"
+                            f"Degistirmek icin:\n"
+                            f"/settings interval <saat>\n"
+                            f"/settings maxsets <sayi>\n"
+                            f"/settings series ekle <seri>\n"
+                            f"/settings series sil <seri>\n"
+                            f"/settings series liste",
+                            chat_id,
+                        )
+                    elif parts[1] == "interval" and len(parts) > 2:
+                        try:
+                            val = int(parts[2])
+                            if 1 <= val <= 48:
+                                BOT_SETTINGS['interval_hours'] = val
+                                await engine.telegram.send_text(f"✅ Tarama araligi: {val} saat", chat_id)
+                            else:
+                                await engine.telegram.send_text("❌ 1-48 arasi olmal.", chat_id)
+                        except ValueError:
+                            await engine.telegram.send_text("❌ Sayi gir: /settings interval 6", chat_id)
+                    elif parts[1] == "maxsets" and len(parts) > 2:
+                        try:
+                            val = int(parts[2])
+                            if 1 <= val <= 20:
+                                BOT_SETTINGS['max_sets'] = val
+                                await engine.telegram.send_text(f"✅ Her seride max {val} set taranacak", chat_id)
+                            else:
+                                await engine.telegram.send_text("❌ 1-20 arasi olmali.", chat_id)
+                        except ValueError:
+                            await engine.telegram.send_text("❌ Sayi gir: /settings maxsets 5", chat_id)
+                    elif parts[1] == "series" and len(parts) > 2:
+                        sub = parts[2].strip()
+                        if sub == "liste":
+                            if BOT_SETTINGS['series']:
+                                lines = [f"{i+1}. {s}" for i, s in enumerate(BOT_SETTINGS['series'])]
+                                await engine.telegram.send_text("📋 Taranacak seriler:\n" + "\n".join(lines), chat_id)
+                            else:
+                                await engine.telegram.send_text("📋 Seri filtresi yok, tum setler taranir.", chat_id)
+                        elif sub.startswith("ekle "):
+                            name = sub[5:].strip()
+                            if name and name not in BOT_SETTINGS['series']:
+                                BOT_SETTINGS['series'].append(name)
+                                await engine.telegram.send_text(f"✅ '{name}' eklendi. Seriler: {', '.join(BOT_SETTINGS['series'])}", chat_id)
+                            else:
+                                await engine.telegram.send_text(f"⚠️ '{name}' zaten listede.", chat_id)
+                        elif sub.startswith("sil "):
+                            name = sub[4:].strip()
+                            if name in BOT_SETTINGS['series']:
+                                BOT_SETTINGS['series'].remove(name)
+                                await engine.telegram.send_text(f"✅ '{name}' silindi. Seriler: {', '.join(BOT_SETTINGS['series']) or 'Bos'}", chat_id)
+                            else:
+                                await engine.telegram.send_text(f"⚠️ '{name}' listede yok.", chat_id)
+                        else:
+                            await engine.telegram.send_text("Kullanim: /settings series liste|ekle <ad>|sil <ad>", chat_id)
+                    else:
+                        await engine.telegram.send_text("⚙️ /settings yazarak ayarlari gor.", chat_id)
+
                 elif text.startswith("/help"):
                     await engine.telegram.send_text(
                         "🃏 Pokemon Arbitrage Bot\n\n"
                         "/series - Serileri butonlarla listele\n"
-                        "/sets - Tüm setleri listele\n"
-                        "/sets <seri adı> - Serinin setlerini butonlarla göster\n"
+                        "/sets - Tum setleri listele\n"
+                        "/sets <seri adi> - Serinin setlerini goster\n"
                         "/analyze <set_code> - Set analiz et\n"
-                        "/check <kart adı> - Tek kart kontrol\n"
-                        "/results - En kârlı kartlar\n"
-                        "/stop - Çalışan taramayı durdur\n"
+                        "/check <kart adi> - Tek kart kontrol\n"
+                        "/results - En karli kartlar\n"
+                        "/stop - Calisan taramayi durdur\n"
+                        "/settings - Ayarlar (interval, seri)\n"
                         "/status - Bot durumu\n"
-                        "/diag - Tanılama testi\n"
+                        "/diag - Tanilama testi\n"
                         "/help - Bu mesaj\n\n"
-                        "Kullanım: /series tıkla → seri seç → set seç → otomatik analiz",
+                        "Kullanim: /series tikla > seri sec > set sec > otomatik analiz",
                         chat_id,
                     )
 
                 elif text.startswith("/status"):
-                    last_run = engine.state.state.get("last_run", "Hiç")
+                    last_run = engine.state.state.get("last_run", "Hic")
                     sets_done = len(engine.state.state.get("analyzed_sets", {}))
                     total_profitable = len(engine.state.results.get("profitable_cards", []))
-                    ebay_status = "✅ Ayarlandı" if (EBAY_CLIENT_ID and EBAY_CLIENT_SECRET) else "❌ Ayarlanmamış"
-                    pw_status = "✅ Ayarlandı" if POKEWALLET_API_KEY else "⚠️ API key yok"
+                    ebay_status = "✅" if (EBAY_CLIENT_ID and EBAY_CLIENT_SECRET) else "❌"
+                    pw_status = "✅" if POKEWALLET_API_KEY else "⚠️"
+                    series_str = ", ".join(BOT_SETTINGS['series']) if BOT_SETTINGS['series'] else "Tum seriler"
+                    task_str = f"⏳ {engine._task_label}" if engine._running_task and not engine._running_task.done() else "Bos"
                     await engine.telegram.send_text(
                         f"📊 Bot Durumu\n\n"
                         f"Son tarama: {last_run}\n"
                         f"Analiz edilen set: {sets_done}\n"
-                        f"Bulunan kârlı kart: {total_profitable}\n"
-                        f"Otomatik tarama: Her {AUTO_SCAN_INTERVAL_HOURS} saatte\n"
-                        f"Watchlist: {', '.join(WATCHLIST_SETS) or 'Yok'}\n\n"
-                        f"API Durumu:\n"
-                        f"PokéWallet: {pw_status}\n"
-                        f"eBay Browse API: {ebay_status}",
+                        f"Karli kart: {total_profitable}\n"
+                        f"Calisan gorev: {task_str}\n\n"
+                        f"Otomatik tarama: Her {BOT_SETTINGS['interval_hours']} saat\n"
+                        f"Seriler: {series_str}\n"
+                        f"Her seride max: {BOT_SETTINGS['max_sets']} set\n\n"
+                        f"PokéWallet: {pw_status} | eBay: {ebay_status}",
                         chat_id,
                     )
 
@@ -1592,7 +1671,8 @@ async def telegram_command_loop(engine: ArbitrageEngine):
 
 
 async def auto_scan_loop(engine: ArbitrageEngine):
-    print(f"[AutoScan] Her {AUTO_SCAN_INTERVAL_HOURS} saatte otomatik tarama yapılacak")
+    print(f"[AutoScan] Her {BOT_SETTINGS['interval_hours']} saatte otomatik tarama")
+    print(f"[AutoScan] Seriler: {BOT_SETTINGS['series']}")
     await asyncio.sleep(30)
 
     while True:
@@ -1601,8 +1681,19 @@ async def auto_scan_loop(engine: ArbitrageEngine):
 
             if not sets_to_scan:
                 all_sets = await engine.pokewallet.get_sets()
-                sorted_sets = sorted(all_sets, key=lambda s: _parse_date(s), reverse=True)
-                sets_to_scan = [s.get("set_code", s.get("id", "")) for s in sorted_sets[:AUTO_SCAN_SET_COUNT]]
+                if BOT_SETTINGS['series']:
+                    filtered = []
+                    for s in all_sets:
+                        series = _get_series_from_set(s)
+                        if any(target.lower() in series.lower() for target in BOT_SETTINGS['series']):
+                            filtered.append(s)
+                    sorted_sets = sorted(filtered, key=lambda s: _parse_date(s), reverse=True)
+                else:
+                    sorted_sets = sorted(all_sets, key=lambda s: _parse_date(s), reverse=True)
+                sets_to_scan = [
+                    s.get("set_code", s.get("id", ""))
+                    for s in sorted_sets[:BOT_SETTINGS['max_sets']]
+                ]
 
             print(f"[AutoScan] Taranacak setler: {sets_to_scan}")
             for set_code in sets_to_scan:
@@ -1613,7 +1704,7 @@ async def auto_scan_loop(engine: ArbitrageEngine):
         except Exception as e:
             print(f"[AutoScan] Error: {e}")
 
-        await asyncio.sleep(AUTO_SCAN_INTERVAL_HOURS * 3600)
+        await asyncio.sleep(BOT_SETTINGS['interval_hours'] * 3600)
 
 
 async def run_service():
@@ -1623,7 +1714,7 @@ async def run_service():
     print("🃏 Pokemon Card Arbitrage Bot başlatıldı!")
     print(f"   PokéWallet API: {'✅' if POKEWALLET_API_KEY else '⚠️ API key yok'}")
     print(f"   eBay Browse API: {'✅' if (EBAY_CLIENT_ID and EBAY_CLIENT_SECRET) else '❌ Ayarlanmamış'}")
-    print(f"   Otomatik tarama: Her {AUTO_SCAN_INTERVAL_HOURS} saat")
+    print(f"   Otomatik tarama: Her {BOT_SETTINGS['interval_hours']} saat")
     print(f"   Watchlist: {WATCHLIST_SETS or 'En son setler'}")
     print(f"   Min kâr: €{MIN_PROFIT_EUR} / %{MIN_PROFIT_PERCENT}")
     print()
@@ -1634,7 +1725,7 @@ async def run_service():
             "🚀 Pokemon Arbitrage Bot başladı!\n\n"
             f"PokéWallet: ✅\n"
             f"eBay API: {ebay_status}\n"
-            f"Otomatik tarama: Her {AUTO_SCAN_INTERVAL_HOURS} saat\n"
+            f"Otomatik tarama: Her {BOT_SETTINGS['interval_hours']} saat\n"
             "Komutlar için /help yazın."
         )
 

@@ -281,34 +281,48 @@ class PokeWalletClient:
     def extract_cardmarket_price(card_data: dict) -> tuple[float, float, str]:
         """Extract Cardmarket avg and trend prices from PokéWallet card data.
         Returns (avg_price, trend_price, product_url).
+        Checks multiple possible data structures.
         """
-        cm = card_data.get("cardmarket", {})
+        # Try multiple paths for cardmarket data
+        cm = card_data.get("cardmarket") or card_data.get("cm") or {}
+        if not cm and "prices" in card_data:
+            p = card_data["prices"]
+            if isinstance(p, dict) and ("cardmarket" in p or "avg" in p or "trend" in p):
+                cm = p.get("cardmarket", p)
+
         if not cm:
             return 0.0, 0.0, ""
 
-        product_url = cm.get("product_url", "")
-        prices_list = cm.get("prices", [])
+        product_url = cm.get("product_url", cm.get("url", ""))
 
-        if isinstance(prices_list, list):
-            for p in prices_list:
+        # Try .prices (list or dict)
+        prices_data = cm.get("prices", cm)
+
+        def _extract(p: dict) -> tuple[float, float]:
+            avg = float(p.get("avg", 0) or p.get("averageSellPrice", 0) or p.get("average", 0) or 0)
+            trend = float(p.get("trend", 0) or p.get("trendPrice", 0) or 0)
+            low = float(p.get("low", 0) or p.get("lowPrice", 0) or 0)
+            price = trend or avg or low
+            return price, trend
+
+        if isinstance(prices_data, list):
+            for p in prices_data:
                 vtype = p.get("variant_type", "")
                 if vtype in ("normal", "holo", ""):
-                    avg = float(p.get("avg", 0) or 0)
-                    trend = float(p.get("trend", 0) or 0)
-                    low = float(p.get("low", 0) or 0)
-                    price = trend or avg or low
-                    return price, trend, product_url
-            if prices_list:
-                p = prices_list[0]
-                avg = float(p.get("avg", 0) or 0)
-                trend = float(p.get("trend", 0) or 0)
-                low = float(p.get("low", 0) or 0)
-                price = trend or avg or low
+                    price, trend = _extract(p)
+                    if price > 0:
+                        return price, trend, product_url
+            if prices_data:
+                price, trend = _extract(prices_data[0])
                 return price, trend, product_url
-        elif isinstance(prices_list, dict):
-            avg = float(prices_list.get("avg", 0) or prices_list.get("trendPrice", 0) or prices_list.get("averageSellPrice", 0) or 0)
-            trend = float(prices_list.get("trend", 0) or prices_list.get("trendPrice", 0) or 0)
-            return avg or trend, trend, product_url
+        elif isinstance(prices_data, dict) and prices_data is not cm:
+            price, trend = _extract(prices_data)
+            return price, trend, product_url
+
+        # Direct fields on cm itself
+        price, trend = _extract(cm)
+        if price > 0:
+            return price, trend, product_url
 
         return 0.0, 0.0, product_url
 
@@ -811,6 +825,14 @@ class ArbitrageEngine:
         if not cards:
             return f"❌ {set_code}: Kart bulunamadı."
 
+        # Debug: log first card's full structure to understand data format
+        if cards:
+            sample = cards[0]
+            print(f"[Table] First card keys: {list(sample.keys())}")
+            print(f"[Table] First card data: {json.dumps(sample, default=str)[:600]}")
+            cm = sample.get("cardmarket", sample.get("cm", sample.get("prices", {})))
+            print(f"[Table] CM data: {json.dumps(cm, default=str)[:400]}")
+
         first_info = PokeWalletClient.extract_card_info(cards[0]) if cards else {}
         set_name = first_info.get("set_name", "") or set_code
 
@@ -1230,65 +1252,72 @@ async def telegram_command_loop(engine: ArbitrageEngine):
 
                     d = []
 
-                    # PokéWallet /sets
+                    # PokéWallet /sets — show unique set_code prefixes
+                    all_sets_data = []
                     try:
                         resp = await cl.get(f"{pw_base}/sets", headers=pw_headers, timeout=15)
                         d.append(f"✅ PW /sets → {resp.status_code}")
                         if resp.status_code == 200:
                             data = resp.json()
-                            items = data if isinstance(data, list) else data.get("data", [])
-                            d.append(f"  {len(items)} set bulundu")
-                            if items:
-                                s = items[0]
-                                d.append(f"  Keys: {list(s.keys())}")
+                            all_sets_data = data if isinstance(data, list) else data.get("data", [])
+                            d.append(f"  {len(all_sets_data)} set bulundu")
+                            if all_sets_data:
+                                d.append(f"  Keys: {list(all_sets_data[0].keys())}")
                     except Exception as e:
                         d.append(f"❌ PW /sets → {e}")
+                    await engine.telegram.send_text("🔧 1/4 Sets\n\n" + "\n".join(d), chat_id)
 
-                    # PokéWallet /sets/SV6 (cards with prices)
-                    try:
-                        resp = await cl.get(f"{pw_base}/sets/SV6", params={"page": 1, "limit": 2}, headers=pw_headers, timeout=15)
-                        d.append(f"\n✅ PW /sets/SV6 → {resp.status_code}")
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            d.append(f"  Keys: {list(data.keys())}")
-                            cards = data.get("cards", data.get("data", []))
-                            if cards:
-                                c = cards[0]
-                                d.append(f"  Card keys: {list(c.keys())}")
-                                cm = c.get("cardmarket", {})
-                                d.append(f"  CM: {json.dumps(cm, default=str)[:300]}")
-                    except Exception as e:
-                        d.append(f"❌ PW /sets/SV6 → {e}")
+                    # Show all set codes grouped
+                    if all_sets_data:
+                        code_lines = []
+                        sorted_by_date = sorted(all_sets_data, key=lambda s: _parse_date(s), reverse=True)
+                        for s in sorted_by_date[:40]:
+                            code = s.get("set_code", s.get("id", "?"))
+                            name = s.get("name", "?")
+                            series = _get_series_from_code(code)
+                            code_lines.append(f"[{code}] {name} → {series}")
+                        await engine.telegram.send_text(
+                            f"🔧 2/4 Set Kodları (ilk 40):\n\n" + "\n".join(code_lines),
+                            chat_id,
+                        )
 
-                    # PokéWallet /search
-                    try:
-                        resp = await cl.get(f"{pw_base}/search", params={"q": "Charizard"}, headers=pw_headers, timeout=15)
-                        d.append(f"\n✅ PW /search?q=Charizard → {resp.status_code}")
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            results = data.get("results", data.get("data", []))
-                            d.append(f"  {len(results)} sonuç")
-                    except Exception as e:
-                        d.append(f"❌ PW /search → {e}")
+                    # PokéWallet card data structure
+                    d2 = []
+                    for test_code in ["SV6", "ME01", "A1"]:
+                        try:
+                            resp = await cl.get(f"{pw_base}/sets/{test_code}", params={"page": 1, "limit": 1}, headers=pw_headers, timeout=15)
+                            d2.append(f"/sets/{test_code} → {resp.status_code}")
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                d2.append(f"  Top keys: {list(data.keys())}")
+                                cards = data.get("cards", data.get("data", []))
+                                if isinstance(data, list):
+                                    cards = data
+                                if cards:
+                                    c = cards[0]
+                                    d2.append(f"  Card: {json.dumps(c, default=str)[:500]}")
+                        except Exception as e:
+                            d2.append(f"/sets/{test_code} → ERR {e}")
+                    await engine.telegram.send_text("🔧 3/4 Kart Yapısı\n\n" + "\n".join(d2), chat_id)
 
                     # eBay Browse API
+                    d3 = []
                     if EBAY_CLIENT_ID and EBAY_CLIENT_SECRET:
                         try:
                             token = await engine.ebay._get_token()
                             if token:
-                                d.append(f"\n✅ eBay OAuth → Token alındı")
+                                d3.append(f"✅ eBay OAuth → Token alındı")
                                 items = await engine.ebay.search_items("Pokemon Charizard", max_results=2)
-                                d.append(f"✅ eBay Search → {len(items)} sonuç")
+                                d3.append(f"✅ eBay Search → {len(items)} sonuç")
                                 if items:
-                                    d.append(f"  İlk: {items[0].get('title', '?')[:60]} £{items[0].get('total_gbp', 0):.2f}")
+                                    d3.append(f"  İlk: {items[0].get('title', '?')[:60]} £{items[0].get('total_gbp', 0):.2f}")
                             else:
-                                d.append(f"\n❌ eBay OAuth → Token alınamadı")
+                                d3.append(f"❌ eBay OAuth → Token alınamadı")
                         except Exception as e:
-                            d.append(f"\n❌ eBay → {e}")
+                            d3.append(f"❌ eBay → {e}")
                     else:
-                        d.append(f"\n⚠️ eBay API anahtarları ayarlanmamış")
-
-                    await engine.telegram.send_text("🔧 Tanılama Sonuçları:\n\n" + "\n".join(d), chat_id)
+                        d3.append(f"⚠️ eBay API anahtarları ayarlanmamış")
+                    await engine.telegram.send_text("🔧 4/4 eBay API\n\n" + "\n".join(d3), chat_id)
 
                 elif text.startswith("/help"):
                     await engine.telegram.send_text(

@@ -85,6 +85,7 @@ LOW_RARITIES = {
 }
 
 SERIES_PREFIX_MAP = {
+    "SVP": "Scarlet & Violet",
     "SV": "Scarlet & Violet",
     "SWSH": "Sword & Shield",
     "SM": "Sun & Moon",
@@ -94,6 +95,7 @@ SERIES_PREFIX_MAP = {
     "PL": "Platinum",
     "DP": "Diamond & Pearl",
     "EX": "EX",
+    "MEW": "Scarlet & Violet",
     "ME": "Mega Evolution",
     "CL": "Call of Legends",
     "NXD": "Next Destinies",
@@ -825,8 +827,6 @@ class ArbitrageEngine:
                 continue
 
             cm_price, cm_trend, cm_url = PokeWalletClient.extract_cardmarket_price(card_data)
-            if cm_price < 0.5:
-                continue
 
             high_rarity_cards.append({
                 "info": info,
@@ -870,19 +870,26 @@ class ArbitrageEngine:
                     ebay_price_gbp = sorted_l[0]["total_gbp"]
                     ebay_price_eur = ebay_price_gbp * GBP_TO_EUR
 
-            if ebay_price_eur > 0:
+            cm_str = f"€{cm_price:.1f}" if cm_price > 0 else "—"
+
+            if ebay_price_eur > 0 and cm_price > 0:
                 calc = self.calculator.calculate(ebay_price_gbp, cm_price)
                 profit = calc["profit_eur"]
                 profit_icon = "🟢" if profit > 0 else "🔴"
                 lines.append(
                     f"{display_name:<18} {short_rarity:<5} "
-                    f"€{cm_price:>5.1f}  £{ebay_price_gbp:>5.1f}  "
+                    f"{cm_str:>6}  £{ebay_price_gbp:.1f}  "
                     f"{profit_icon} €{profit:>+.1f}"
+                )
+            elif ebay_price_eur > 0:
+                lines.append(
+                    f"{display_name:<18} {short_rarity:<5} "
+                    f"{'—':>6}  £{ebay_price_gbp:.1f}  {'—':>6}"
                 )
             else:
                 lines.append(
                     f"{display_name:<18} {short_rarity:<5} "
-                    f"€{cm_price:>5.1f}  {'—':>6}  {'—':>6}"
+                    f"{cm_str:>6}  {'—':>6}  {'—':>6}"
                 )
 
         total_shown = min(len(high_rarity_cards), 25)

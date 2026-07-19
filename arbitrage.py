@@ -1320,10 +1320,11 @@ class ArbitrageEngine:
 async def health_server():
     async def handle(reader, writer):
         await reader.read(1024)
+        uptime = int(time.time() - _start_time)
         response = (
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/plain\r\n\r\n"
-            "Pokemon Card Arbitrage Bot - Running\n"
+            f"Pokemon Card Arbitrage Bot - Running ({uptime}s)\n"
         )
         writer.write(response.encode())
         await writer.drain()
@@ -1332,6 +1333,26 @@ async def health_server():
     server = await asyncio.start_server(handle, "0.0.0.0", PORT)
     print(f"[Health] Listening on port {PORT}")
     await server.serve_forever()
+
+
+_start_time = time.time()
+
+
+async def keep_alive_loop():
+    """Ping own health endpoint every 10 min to prevent Render free tier sleep."""
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if not render_url:
+        print("[KeepAlive] RENDER_EXTERNAL_URL not set, skipping keep-alive")
+        return
+    print(f"[KeepAlive] Pinging {render_url} every 10 min")
+    async with httpx.AsyncClient() as client:
+        while True:
+            await asyncio.sleep(600)
+            try:
+                resp = await client.get(render_url, timeout=10)
+                print(f"[KeepAlive] Ping -> {resp.status_code}")
+            except Exception as e:
+                print(f"[KeepAlive] Ping failed: {e}")
 
 
 async def telegram_command_loop(engine: ArbitrageEngine):
@@ -1733,6 +1754,7 @@ async def run_service():
         health_server(),
         telegram_command_loop(engine),
         auto_scan_loop(engine),
+        keep_alive_loop(),
     )
 
 

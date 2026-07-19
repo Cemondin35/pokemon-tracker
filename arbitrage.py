@@ -125,8 +125,14 @@ class PokeWalletClient:
         self.headers = {}
         if POKEWALLET_API_KEY:
             self.headers["X-API-Key"] = POKEWALLET_API_KEY
+        self._sets_cache: list[dict] = []
+        self._sets_cache_time: float = 0
 
     async def get_sets(self) -> list[dict]:
+        # Return cached data if fresh (5 minutes)
+        if self._sets_cache and (time.time() - self._sets_cache_time) < 300:
+            return self._sets_cache
+
         # Use pokemontcg.io as primary — it has series, proper IDs, releaseDate
         try:
             page = 1
@@ -149,6 +155,8 @@ class PokeWalletClient:
                 page += 1
             if all_sets:
                 print(f"[ptcg] Total sets: {len(all_sets)}")
+                self._sets_cache = all_sets
+                self._sets_cache_time = time.time()
                 return all_sets
         except Exception as e:
             print(f"[ptcg] Sets error: {e}")
@@ -162,6 +170,8 @@ class PokeWalletClient:
             resp.raise_for_status()
             data = resp.json()
             items = data if isinstance(data, list) else data.get("data", data.get("sets", []))
+            self._sets_cache = items
+            self._sets_cache_time = time.time()
             return items
         except Exception as e:
             print(f"[PokeWallet] Error fetching sets: {e}")
@@ -483,19 +493,21 @@ class TelegramBot:
         try:
             resp = await self.client.get(
                 f"https://api.telegram.org/bot{self.token}/getUpdates",
-                params={
-                    "offset": self.last_update_id + 1,
-                    "timeout": 5,
-                    "allowed_updates": json.dumps(["message", "callback_query"]),
-                },
+                params={"offset": self.last_update_id + 1, "timeout": 5},
                 timeout=15,
             )
             data = resp.json()
             updates = data.get("result", [])
             if updates:
                 self.last_update_id = updates[-1]["update_id"]
+                for u in updates:
+                    if "callback_query" in u:
+                        print(f"[Bot] Callback received: {u['callback_query'].get('data', '?')}")
+                    elif "message" in u:
+                        print(f"[Bot] Message: {u['message'].get('text', '?')[:50]}")
             return updates
-        except Exception:
+        except Exception as e:
+            print(f"[Bot] getUpdates error: {e}")
             return []
 
     async def _send_photo(self, photo_url: str, caption: str):
@@ -893,29 +905,37 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                 # Handle callback queries (inline button presses)
                 cb = update.get("callback_query")
                 if cb:
-                    cb_id = cb["id"]
+                    cb_id = cb.get("id", "")
                     cb_data = cb.get("data", "")
                     cb_chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                    print(f"[Bot] Processing callback: data='{cb_data}' chat={cb_chat_id}")
 
                     if cb_chat_id != TELEGRAM_CHAT_ID:
+                        print(f"[Bot] Skipping callback: chat {cb_chat_id} != {TELEGRAM_CHAT_ID}")
+                        await engine.telegram.answer_callback(cb_id)
                         continue
 
-                    await engine.telegram.answer_callback(cb_id, "⏳")
+                    try:
+                        await engine.telegram.answer_callback(cb_id, "⏳ İşleniyor...")
 
-                    if cb_data.startswith("series:"):
-                        series_name = cb_data[7:]
-                        text, buttons = await engine.list_sets_buttons(series_name)
-                        if buttons:
-                            await engine.telegram.send_inline_keyboard(text, buttons, cb_chat_id)
-                        else:
-                            await engine.telegram.send_text(text, cb_chat_id)
+                        if cb_data.startswith("series:"):
+                            series_name = cb_data[7:]
+                            print(f"[Bot] Loading sets for series: '{series_name}'")
+                            text, buttons = await engine.list_sets_buttons(series_name)
+                            if buttons:
+                                await engine.telegram.send_inline_keyboard(text, buttons, cb_chat_id)
+                            else:
+                                await engine.telegram.send_text(text, cb_chat_id)
 
-                    elif cb_data.startswith("analyze:"):
-                        set_id = cb_data[8:]
-                        await engine.telegram.send_text(f"🔍 {set_id} analiz ediliyor... (bu biraz sürebilir)", cb_chat_id)
-                        profitable = await engine.analyze_set(set_id, force=True)
-                        if not profitable:
-                            await engine.telegram.send_text(f"❌ {set_id}: Kârlı kart bulunamadı.", cb_chat_id)
+                        elif cb_data.startswith("analyze:"):
+                            set_id = cb_data[8:]
+                            await engine.telegram.send_text(f"🔍 {set_id} analiz ediliyor... (bu biraz sürebilir)", cb_chat_id)
+                            profitable = await engine.analyze_set(set_id, force=True)
+                            if not profitable:
+                                await engine.telegram.send_text(f"❌ {set_id}: Kârlı kart bulunamadı.", cb_chat_id)
+                    except Exception as e:
+                        print(f"[Bot] Callback error: {e}")
+                        await engine.telegram.send_text(f"❌ Hata: {e}", cb_chat_id)
 
                     continue
 
@@ -960,8 +980,14 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                 elif text.startswith("/check"):
                     card_name = text.replace("/check", "").strip()
                     if not card_name:
-                        await engine.telegram.send_text("Kullanım: /check <kart adı>", chat_id)
+                        await engine.telegram.send_text(
+                            "Kullanım: /check <kart adı>\n"
+                            "Örnek: /check Charizard ex\n\n"
+                            "Set analizi için /series butonlarını kullanın.",
+                            chat_id,
+                        )
                     else:
+                        await engine.telegram.send_text(f"🔍 '{card_name}' aranıyor...", chat_id)
                         result = await engine.quick_check(card_name)
                         await engine.telegram.send_text(result, chat_id)
 

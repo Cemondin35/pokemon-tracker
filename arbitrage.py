@@ -855,13 +855,74 @@ class ArbitrageEngine:
         if not cards:
             return f"❌ {set_code}: Kart bulunamadı."
 
-        # Debug: log first card's full structure to understand data format
+        # Debug: show card structure in first message
+        debug_lines = []
         if cards:
             sample = cards[0]
-            print(f"[Table] First card keys: {list(sample.keys())}")
-            print(f"[Table] First card data: {json.dumps(sample, default=str)[:600]}")
-            cm = sample.get("cardmarket", sample.get("cm", sample.get("prices", {})))
-            print(f"[Table] CM data: {json.dumps(cm, default=str)[:400]}")
+            debug_lines.append(f"Card keys: {list(sample.keys())}")
+            cm = sample.get("cardmarket", sample.get("cm", None))
+            tcg = sample.get("tcgplayer", sample.get("tcg", None))
+            prices = sample.get("prices", None)
+            if cm:
+                debug_lines.append(f"CM: {json.dumps(cm, default=str)[:300]}")
+            if tcg:
+                debug_lines.append(f"TCG: {json.dumps(tcg, default=str)[:200]}")
+            if prices:
+                debug_lines.append(f"Prices: {json.dumps(prices, default=str)[:300]}")
+            if not cm and not tcg and not prices:
+                debug_lines.append("⚠️ cardmarket/tcgplayer/prices alanı YOK")
+                debug_lines.append(f"Tüm veri: {json.dumps(sample, default=str)[:500]}")
+
+            # Try /cards/:id for first card to see if it has prices
+            card_id = sample.get("id", "")
+            if card_id and not cm:
+                try:
+                    resp = await self.client.get(
+                        f"{self.pokewallet.base_url}/cards/{card_id}",
+                        headers=self.pokewallet.headers, timeout=15,
+                    )
+                    if resp.status_code == 200:
+                        detail = resp.json()
+                        detail_cm = detail.get("cardmarket", detail.get("cm", None))
+                        debug_lines.append(f"\n/cards/{card_id[:20]}... → 200")
+                        debug_lines.append(f"Detail keys: {list(detail.keys())}")
+                        if detail_cm:
+                            debug_lines.append(f"Detail CM: {json.dumps(detail_cm, default=str)[:300]}")
+                        else:
+                            debug_lines.append(f"Detail data: {json.dumps(detail, default=str)[:400]}")
+                    else:
+                        debug_lines.append(f"\n/cards/{card_id[:20]}... → {resp.status_code}")
+                except Exception as e:
+                    debug_lines.append(f"/cards/ → ERR {e}")
+
+            # Try /search endpoint too
+            sample_info = PokeWalletClient.extract_card_info(sample)
+            search_name = sample_info.get("name", "")
+            if search_name and not cm:
+                try:
+                    resp = await self.client.get(
+                        f"{self.pokewallet.base_url}/search",
+                        params={"q": search_name},
+                        headers=self.pokewallet.headers, timeout=15,
+                    )
+                    if resp.status_code == 200:
+                        sdata = resp.json()
+                        results = sdata if isinstance(sdata, list) else sdata.get("data", sdata.get("cards", []))
+                        if results and isinstance(results, list) and len(results) > 0:
+                            sr = results[0]
+                            sr_cm = sr.get("cardmarket", sr.get("cm", None))
+                            debug_lines.append(f"\n/search?q={search_name[:15]} → {len(results)} results")
+                            debug_lines.append(f"Search keys: {list(sr.keys())}")
+                            if sr_cm:
+                                debug_lines.append(f"Search CM: {json.dumps(sr_cm, default=str)[:300]}")
+                            else:
+                                debug_lines.append(f"Search data: {json.dumps(sr, default=str)[:400]}")
+                        else:
+                            debug_lines.append(f"/search?q={search_name[:15]} → empty ({type(sdata).__name__})")
+                    else:
+                        debug_lines.append(f"/search → {resp.status_code}")
+                except Exception as e:
+                    debug_lines.append(f"/search → ERR {e}")
 
         first_info = PokeWalletClient.extract_card_info(cards[0]) if cards else {}
         set_name = first_info.get("set_name", "") or set_code
@@ -950,6 +1011,10 @@ class ArbitrageEngine:
 
         if not ebay_available:
             lines.append("\n⚠️ eBay API ayarlanmamış — sadece CM fiyatları gösteriliyor")
+
+        if debug_lines:
+            lines.append("\n🔧 Debug:")
+            lines.extend(debug_lines)
 
         return "\n".join(lines)
 

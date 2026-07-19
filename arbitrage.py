@@ -119,13 +119,14 @@ class PokeWalletClient:
         self.base_url = POKEWALLET_API_BASE
         self.headers = {}
         if POKEWALLET_API_KEY:
-            self.headers["Authorization"] = f"Bearer {POKEWALLET_API_KEY}"
+            self.headers["X-API-Key"] = POKEWALLET_API_KEY
 
     async def get_sets(self) -> list[dict]:
         try:
             resp = await self.client.get(
                 f"{self.base_url}/sets", headers=self.headers, timeout=30
             )
+            print(f"[PokeWallet] GET /sets -> {resp.status_code}")
             resp.raise_for_status()
             data = resp.json()
             return data if isinstance(data, list) else data.get("data", data.get("sets", []))
@@ -153,6 +154,7 @@ class PokeWalletClient:
             resp = await self.client.get(
                 f"{self.base_url}/cards", params=params, headers=self.headers, timeout=30
             )
+            print(f"[PokeWallet] GET /cards?q={name} -> {resp.status_code}")
             resp.raise_for_status()
             data = resp.json()
             return data if isinstance(data, list) else data.get("data", data.get("cards", []))

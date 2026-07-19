@@ -134,7 +134,11 @@ class PokeWalletClient:
             print(f"[PokeWallet] GET /sets -> {resp.status_code}")
             resp.raise_for_status()
             data = resp.json()
-            return data if isinstance(data, list) else data.get("data", data.get("sets", []))
+            items = data if isinstance(data, list) else data.get("data", data.get("sets", []))
+            if items:
+                print(f"[PokeWallet] Sample set keys: {list(items[0].keys())}")
+                print(f"[PokeWallet] Sample set: {json.dumps(items[0], default=str)[:500]}")
+            return items
         except Exception as e:
             print(f"[PokeWallet] Error fetching sets: {e}")
             return []
@@ -485,7 +489,7 @@ class ArbitrageEngine:
         if not sets:
             return "❌ Set listesi alınamadı."
         # En yeni setler önce (son çıkanlar daha kolay satılır)
-        sets_sorted = sorted(sets, key=lambda s: s.get("releaseDate", s.get("release_date", "")), reverse=True)
+        sets_sorted = sorted(sets, key=lambda s: s.get("releaseDate") or s.get("release_date") or "", reverse=True)
         lines = [f"📦 {len(sets)} set bulundu (en yeniden eskiye):\n"]
         for i, s in enumerate(sets_sorted[:20], 1):
             name = s.get("name", "?")
@@ -731,7 +735,7 @@ async def auto_scan_loop(engine: ArbitrageEngine):
             # If no watchlist, scan latest sets
             if not sets_to_scan:
                 all_sets = await engine.pokewallet.get_sets()
-                sorted_sets = sorted(all_sets, key=lambda s: s.get("releaseDate", ""), reverse=True)
+                sorted_sets = sorted(all_sets, key=lambda s: s.get("releaseDate") or s.get("release_date") or "", reverse=True)
                 sets_to_scan = [s.get("id", s.get("set_id", "")) for s in sorted_sets[:AUTO_SCAN_SET_COUNT]]
 
             print(f"[AutoScan] Taranacak setler: {sets_to_scan}")
@@ -805,7 +809,7 @@ async def run_cli():
         elif command == "scan":
             limit = int(sys.argv[2]) if len(sys.argv) > 2 else 3
             sets = await engine.pokewallet.get_sets()
-            sorted_sets = sorted(sets, key=lambda s: s.get("releaseDate", ""), reverse=True)
+            sorted_sets = sorted(sets, key=lambda s: s.get("releaseDate") or s.get("release_date") or "", reverse=True)
             for s in sorted_sets[:limit]:
                 sid = s.get("id", s.get("set_id", ""))
                 if sid:

@@ -143,14 +143,11 @@ class PokeWalletClient:
             print(f"[PokeWallet] Error fetching sets: {e}")
             return []
 
-    async def get_set_cards(self, set_id: str) -> list[dict]:
-        # Try multiple endpoint patterns (PokéWallet + pokemontcg.io style)
+    async def get_set_cards(self, set_id: str, set_name: str = "") -> list[dict]:
         endpoints = [
             (f"{self.base_url}/cards?q=set.id:{set_id}", self.headers),
             (f"{self.base_url}/sets/{set_id}/cards", self.headers),
             (f"{self.base_url}/cards?set={set_id}", self.headers),
-            (f"{self.base_url}/cards?set.name:{set_id}", self.headers),
-            # Fallback: pokemontcg.io (free, no key needed)
             (f"https://api.pokemontcg.io/v2/cards?q=set.id:{set_id}&select=name,number,rarity,images,set,cardmarket", {}),
         ]
         for url, headers in endpoints:
@@ -166,6 +163,46 @@ class PokeWalletClient:
                         return items
             except Exception as e:
                 print(f"[API] Error: {e}")
+
+        # Last resort: search pokemontcg.io by set name
+        if set_name:
+            try:
+                url = f"https://api.pokemontcg.io/v2/cards?q=set.name:\"{set_name}\"&select=name,number,rarity,images,set,cardmarket&pageSize=50"
+                resp = await self.client.get(url, headers={}, timeout=30)
+                print(f"[API] ptcg name search '{set_name}' -> {resp.status_code}")
+                if resp.status_code == 200:
+                    items = resp.json().get("data", [])
+                    if items:
+                        print(f"[API] Found {len(items)} cards by name")
+                        return items
+            except Exception as e:
+                print(f"[API] Name search error: {e}")
+
+        # Try to resolve set_id via pokemontcg.io sets endpoint
+        try:
+            resp = await self.client.get(
+                f"https://api.pokemontcg.io/v2/sets?q=id:{set_id} OR ptcgoCode:{set_id}",
+                headers={}, timeout=30,
+            )
+            if resp.status_code == 200:
+                set_data = resp.json().get("data", [])
+                if set_data:
+                    real_id = set_data[0].get("id", "")
+                    real_name = set_data[0].get("name", "")
+                    print(f"[API] Resolved set: {set_id} -> {real_id} ({real_name})")
+                    if real_id and real_id != set_id:
+                        resp2 = await self.client.get(
+                            f"https://api.pokemontcg.io/v2/cards?q=set.id:{real_id}&select=name,number,rarity,images,set,cardmarket&pageSize=100",
+                            headers={}, timeout=30,
+                        )
+                        if resp2.status_code == 200:
+                            items = resp2.json().get("data", [])
+                            if items:
+                                print(f"[API] Found {len(items)} cards via resolved ID")
+                                return items
+        except Exception as e:
+            print(f"[API] Set resolve error: {e}")
+
         print(f"[API] No cards found for set {set_id}")
         return []
 
@@ -382,17 +419,49 @@ class TelegramBot:
 
         await self._send_message(text)
 
-    async def send_text(self, text: str):
-        await self._send_message(text, parse_mode=None)
+    async def send_text(self, text: str, chat_id: str = ""):
+        await self._send_message(text, parse_mode=None, chat_id=chat_id)
+
+    async def send_inline_keyboard(self, text: str, buttons: list[list[dict]], chat_id: str = ""):
+        if not self.token:
+            return
+        try:
+            await self.client.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                json={
+                    "chat_id": chat_id or self.chat_id,
+                    "text": text,
+                    "reply_markup": {"inline_keyboard": buttons},
+                },
+                timeout=30,
+            )
+        except Exception as e:
+            print(f"[Telegram] Inline keyboard failed: {e}")
+
+    async def answer_callback(self, callback_id: str, text: str = ""):
+        if not self.token:
+            return
+        try:
+            await self.client.post(
+                f"https://api.telegram.org/bot{self.token}/answerCallbackQuery",
+                json={"callback_query_id": callback_id, "text": text or ""},
+                timeout=10,
+            )
+        except Exception:
+            pass
 
     async def get_updates(self) -> list[dict]:
-        """Poll for new Telegram messages (bot commands)."""
+        """Poll for new Telegram messages and callback queries."""
         if not self.token:
             return []
         try:
             resp = await self.client.get(
                 f"https://api.telegram.org/bot{self.token}/getUpdates",
-                params={"offset": self.last_update_id + 1, "timeout": 5},
+                params={
+                    "offset": self.last_update_id + 1,
+                    "timeout": 5,
+                    "allowed_updates": json.dumps(["message", "callback_query"]),
+                },
                 timeout=15,
             )
             data = resp.json()
@@ -419,11 +488,11 @@ class TelegramBot:
             print(f"[Telegram] Photo failed ({e}), sending as text")
             await self._send_message(caption)
 
-    async def _send_message(self, text: str, parse_mode: str = "MarkdownV2"):
-        if not self.token or not self.chat_id:
+    async def _send_message(self, text: str, parse_mode: str = "MarkdownV2", chat_id: str = ""):
+        if not self.token:
             return
         try:
-            payload = {"chat_id": self.chat_id, "text": text}
+            payload = {"chat_id": chat_id or self.chat_id, "text": text}
             if parse_mode:
                 payload["parse_mode"] = parse_mode
             await self.client.post(
@@ -524,13 +593,8 @@ class ArbitrageEngine:
         if self.client:
             await self.client.aclose()
 
-    async def list_series(self) -> str:
-        """List all series/eras (newest first)."""
-        sets = await self.pokewallet.get_sets()
-        if not sets:
-            return "❌ Seri listesi alınamadı."
-
-        # Group by series
+    def _group_series(self, sets: list[dict]) -> list[tuple[str, dict]]:
+        """Group sets by series, sorted newest first."""
         series_map = {}
         for s in sets:
             series = s.get("series") or s.get("set_series") or "Diğer"
@@ -540,9 +604,15 @@ class ArbitrageEngine:
             d = _parse_date(s)
             if d > series_map[series]["latest_date"]:
                 series_map[series]["latest_date"] = d
+        return sorted(series_map.items(), key=lambda x: x[1]["latest_date"], reverse=True)
 
-        # Sort series by latest set date (newest first)
-        sorted_series = sorted(series_map.items(), key=lambda x: x[1]["latest_date"], reverse=True)
+    async def list_series(self) -> str:
+        """List all series/eras (newest first)."""
+        sets = await self.pokewallet.get_sets()
+        if not sets:
+            return "❌ Seri listesi alınamadı."
+
+        sorted_series = self._group_series(sets)
 
         lines = ["📚 SERİLER (en yeniden eskiye):\n"]
         for i, (name, info) in enumerate(sorted_series, 1):
@@ -550,6 +620,50 @@ class ArbitrageEngine:
             lines.append(f"{i}. {name} ({count} set)")
         lines.append(f"\nBir serinin setlerini görmek için:\n/sets <seri adı>\nÖrn: /sets Scarlet & Violet")
         return "\n".join(lines)
+
+    async def list_series_buttons(self) -> tuple[str, list[list[dict]]]:
+        """Return series as inline keyboard buttons."""
+        sets = await self.pokewallet.get_sets()
+        if not sets:
+            return "❌ Seri listesi alınamadı.", []
+
+        sorted_series = self._group_series(sets)
+
+        buttons = []
+        for name, info in sorted_series[:20]:
+            count = len(info["sets"])
+            btn_text = f"{name} ({count})"
+            # Truncate callback data to 64 bytes (Telegram limit)
+            cb_data = f"series:{name[:50]}"
+            buttons.append([{"text": btn_text, "callback_data": cb_data}])
+
+        return "📚 Bir seri seçin:", buttons
+
+    async def list_sets_buttons(self, series_filter: str) -> tuple[str, list[list[dict]]]:
+        """Return sets in a series as inline keyboard buttons."""
+        sets = await self.pokewallet.get_sets()
+        if not sets:
+            return "❌ Set listesi alınamadı.", []
+
+        filter_lower = series_filter.lower()
+        filtered = [s for s in sets if filter_lower in (s.get("series") or s.get("set_series") or "").lower()]
+        if not filtered:
+            filtered = [s for s in sets if filter_lower in (s.get("name") or "").lower()]
+        if not filtered:
+            return f"❌ '{series_filter}' serisi bulunamadı.", []
+
+        sets_sorted = sorted(filtered, key=lambda s: _parse_date(s), reverse=True)
+
+        buttons = []
+        for s in sets_sorted[:30]:
+            name = s.get("name", "?")
+            sid = s.get("id", s.get("set_id", ""))
+            total = s.get("total", s.get("totalCards", "?"))
+            btn_text = f"{name} ({total} kart)"
+            cb_data = f"analyze:{sid}"
+            buttons.append([{"text": btn_text, "callback_data": cb_data}])
+
+        return f"📦 {series_filter} setleri ({len(sets_sorted)} set):", buttons
 
     async def list_sets(self, series_filter: str = "") -> str:
         """List sets, optionally filtered by series."""
@@ -587,11 +701,20 @@ class ArbitrageEngine:
         if not force and self.state.is_set_recent(set_id):
             return []
 
-        cards = await self.pokewallet.get_set_cards(set_id)
+        # Try to get set name from the sets list for better fallback search
+        set_name_hint = ""
+        all_sets = await self.pokewallet.get_sets()
+        for s in all_sets:
+            sid = s.get("id", s.get("set_id", ""))
+            if str(sid) == str(set_id):
+                set_name_hint = s.get("name", "")
+                break
+
+        cards = await self.pokewallet.get_set_cards(set_id, set_name=set_name_hint)
         if not cards:
             return []
 
-        set_name = cards[0].get("set", {}).get("name", set_id) if cards else set_id
+        set_name = cards[0].get("set", {}).get("name", set_name_hint or set_id) if cards else set_id
         profitable = []
 
         for card_data in cards:
@@ -734,13 +857,43 @@ async def health_server():
 
 
 async def telegram_command_loop(engine: ArbitrageEngine):
-    """Listen for Telegram bot commands."""
+    """Listen for Telegram bot commands and inline button callbacks."""
     print("[Bot] Telegram komut dinleme başladı...")
 
     while True:
         try:
             updates = await engine.telegram.get_updates()
             for update in updates:
+                # Handle callback queries (inline button presses)
+                cb = update.get("callback_query")
+                if cb:
+                    cb_id = cb["id"]
+                    cb_data = cb.get("data", "")
+                    cb_chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+
+                    if cb_chat_id != TELEGRAM_CHAT_ID:
+                        continue
+
+                    await engine.telegram.answer_callback(cb_id, "⏳")
+
+                    if cb_data.startswith("series:"):
+                        series_name = cb_data[7:]
+                        text, buttons = await engine.list_sets_buttons(series_name)
+                        if buttons:
+                            await engine.telegram.send_inline_keyboard(text, buttons, cb_chat_id)
+                        else:
+                            await engine.telegram.send_text(text, cb_chat_id)
+
+                    elif cb_data.startswith("analyze:"):
+                        set_id = cb_data[8:]
+                        await engine.telegram.send_text(f"🔍 {set_id} analiz ediliyor... (bu biraz sürebilir)", cb_chat_id)
+                        profitable = await engine.analyze_set(set_id, force=True)
+                        if not profitable:
+                            await engine.telegram.send_text(f"❌ {set_id}: Kârlı kart bulunamadı.", cb_chat_id)
+
+                    continue
+
+                # Handle regular messages
                 msg = update.get("message", {})
                 text = msg.get("text", "").strip()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -749,37 +902,47 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                     continue
 
                 if text.startswith("/series"):
-                    result = await engine.list_series()
-                    await engine.telegram.send_text(result)
+                    title, buttons = await engine.list_series_buttons()
+                    if buttons:
+                        await engine.telegram.send_inline_keyboard(title, buttons, chat_id)
+                    else:
+                        await engine.telegram.send_text(title, chat_id)
 
                 elif text.startswith("/sets"):
                     series_filter = text.replace("/sets", "").strip()
-                    result = await engine.list_sets(series_filter)
-                    await engine.telegram.send_text(result)
+                    if series_filter:
+                        title, buttons = await engine.list_sets_buttons(series_filter)
+                        if buttons:
+                            await engine.telegram.send_inline_keyboard(title, buttons, chat_id)
+                        else:
+                            await engine.telegram.send_text(title, chat_id)
+                    else:
+                        result = await engine.list_sets()
+                        await engine.telegram.send_text(result, chat_id)
 
                 elif text.startswith("/analyze"):
                     parts = text.split()
                     if len(parts) < 2:
-                        await engine.telegram.send_text("Kullanım: /analyze <set_id>")
+                        await engine.telegram.send_text("Kullanım: /analyze <set_id>", chat_id)
                     else:
                         set_id = parts[1]
-                        await engine.telegram.send_text(f"🔍 {set_id} analiz ediliyor...")
+                        await engine.telegram.send_text(f"🔍 {set_id} analiz ediliyor...", chat_id)
                         profitable = await engine.analyze_set(set_id, force=True)
                         if not profitable:
-                            await engine.telegram.send_text(f"❌ {set_id}: Kârlı kart bulunamadı.")
+                            await engine.telegram.send_text(f"❌ {set_id}: Kârlı kart bulunamadı.", chat_id)
 
                 elif text.startswith("/check"):
                     card_name = text.replace("/check", "").strip()
                     if not card_name:
-                        await engine.telegram.send_text("Kullanım: /check <kart adı>")
+                        await engine.telegram.send_text("Kullanım: /check <kart adı>", chat_id)
                     else:
                         result = await engine.quick_check(card_name)
-                        await engine.telegram.send_text(result)
+                        await engine.telegram.send_text(result, chat_id)
 
                 elif text.startswith("/results"):
                     top = engine.state.get_top_results(10)
                     if not top:
-                        await engine.telegram.send_text("Henüz kârlı kart bulunamadı.")
+                        await engine.telegram.send_text("Henüz kârlı kart bulunamadı.", chat_id)
                     else:
                         lines = ["💰 EN KÂRLI KARTLAR:\n"]
                         for i, c in enumerate(top, 1):
@@ -787,23 +950,21 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                                 f"{i}. {c['name']} ({c['set_name']})\n"
                                 f"   €{c['profit_eur']:.2f} kâr ({c['profit_percent']:.1f}%)"
                             )
-                        await engine.telegram.send_text("\n".join(lines))
+                        await engine.telegram.send_text("\n".join(lines), chat_id)
 
                 elif text.startswith("/help"):
                     await engine.telegram.send_text(
                         "🃏 Pokemon Arbitrage Bot\n\n"
-                        "/series - Tüm serileri listele\n"
-                        "/sets <seri adı> - Serinin setlerini göster\n"
+                        "/series - Serileri butonlarla listele\n"
+                        "/sets - Tüm setleri listele\n"
+                        "/sets <seri adı> - Serinin setlerini butonlarla göster\n"
                         "/analyze <set_id> - Set analiz et\n"
                         "/check <kart adı> - Tek kart kontrol\n"
                         "/results - En kârlı kartlar\n"
                         "/status - Bot durumu\n"
                         "/help - Bu mesaj\n\n"
-                        "Örnek:\n"
-                        "/series\n"
-                        "/sets Scarlet & Violet\n"
-                        "/analyze sv6\n"
-                        "/check Charizard ex"
+                        "Kullanım: /series tıkla → seri seç → set seç → otomatik analiz",
+                        chat_id,
                     )
 
                 elif text.startswith("/status"):
@@ -816,7 +977,8 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                         f"Analiz edilen set: {sets_done}\n"
                         f"Bulunan kârlı kart: {total_profitable}\n"
                         f"Otomatik tarama: Her {AUTO_SCAN_INTERVAL_HOURS} saatte\n"
-                        f"Watchlist: {', '.join(WATCHLIST_SETS) or 'Yok'}"
+                        f"Watchlist: {', '.join(WATCHLIST_SETS) or 'Yok'}",
+                        chat_id,
                     )
 
         except Exception as e:

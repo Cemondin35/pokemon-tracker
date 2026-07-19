@@ -477,14 +477,17 @@ class ArbitrageEngine:
         sets = await self.pokewallet.get_sets()
         if not sets:
             return "❌ Set listesi alınamadı."
-        lines = [f"📦 {len(sets)} set bulundu:\n"]
-        for i, s in enumerate(sets[:20], 1):
+        # En yeni setler önce (son çıkanlar daha kolay satılır)
+        sets_sorted = sorted(sets, key=lambda s: s.get("releaseDate", s.get("release_date", "")), reverse=True)
+        lines = [f"📦 {len(sets)} set bulundu (en yeniden eskiye):\n"]
+        for i, s in enumerate(sets_sorted[:20], 1):
             name = s.get("name", "?")
             sid = s.get("id", s.get("set_id", ""))
             total = s.get("total", s.get("totalCards", "?"))
-            lines.append(f"{i}. [{sid}] {name} ({total} kart)")
+            date = s.get("releaseDate", s.get("release_date", ""))
+            lines.append(f"{i}. [{sid}] {name} ({total} kart) {date}")
         if len(sets) > 20:
-            lines.append(f"...ve {len(sets) - 20} set daha")
+            lines.append(f"\n...ve {len(sets) - 20} set daha")
         return "\n".join(lines)
 
     async def analyze_set(self, set_id: str, force: bool = False) -> list[CardPrice]:

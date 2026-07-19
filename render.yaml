@@ -3,9 +3,13 @@ services:
     name: pokemon-arbitrage
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python arbitrage.py serve
+    startCommand: python -u arbitrage.py serve
     plan: free
     envVars:
+      - key: PORT
+        value: "10000"
+      - key: PYTHONUNBUFFERED
+        value: "1"
       - key: TELEGRAM_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID

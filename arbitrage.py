@@ -365,11 +365,11 @@ class PokeWalletClient:
         card_id = card_data.get("id", "")
         return {
             "id": card_id,
-            "name": ci.get("name", card_data.get("name", "Unknown")),
+            "name": ci.get("name") or card_data.get("name") or "Unknown",
             "set_name": ci.get("set_name", card_data.get("set_name", "")),
             "set_code": ci.get("set_code", card_data.get("set_code", "")),
-            "card_number": ci.get("card_number", card_data.get("number", card_data.get("card_number", ""))),
-            "rarity": ci.get("rarity", card_data.get("rarity", "")),
+            "card_number": ci.get("card_number") or card_data.get("number") or card_data.get("card_number") or "",
+            "rarity": ci.get("rarity") or card_data.get("rarity") or "",
         }
 
 
@@ -876,6 +876,8 @@ class ArbitrageEngine:
 
         high_rarity_cards = []
         all_rarities = set()
+        detail_fetch_count = 0
+        MAX_DETAIL_FETCHES = 60
         for card_data in cards:
             info = PokeWalletClient.extract_card_info(card_data)
             rarity = info["rarity"]
@@ -886,8 +888,7 @@ class ArbitrageEngine:
 
             cm_price, cm_trend, cm_url = PokeWalletClient.extract_cardmarket_price(card_data)
 
-            # If set listing has no prices, fetch individual card detail
-            if cm_price == 0 and not set_has_prices:
+            if cm_price == 0 and not set_has_prices and detail_fetch_count < MAX_DETAIL_FETCHES:
                 card_id = card_data.get("id", "")
                 if card_id:
                     try:
@@ -895,9 +896,13 @@ class ArbitrageEngine:
                             f"{self.pokewallet.base_url}/cards/{card_id}",
                             headers=self.pokewallet.headers, timeout=15,
                         )
+                        detail_fetch_count += 1
                         if resp.status_code == 200:
                             detail = resp.json()
                             cm_price, cm_trend, cm_url = PokeWalletClient.extract_cardmarket_price(detail)
+                        elif resp.status_code == 429:
+                            print(f"[Table] Rate limited at {detail_fetch_count} fetches")
+                            detail_fetch_count = MAX_DETAIL_FETCHES
                         await asyncio.sleep(REQUEST_DELAY)
                     except Exception:
                         pass
@@ -929,7 +934,9 @@ class ArbitrageEngine:
             rarity = info["rarity"]
             cm_price = entry["cm_price"]
 
-            short_rarity = self._short_rarity(rarity)
+            short_rarity = self._short_rarity(rarity or "")
+            card_name = card_name or "?"
+            card_number = card_number or ""
             num = card_number.split("/")[0] if "/" in card_number else card_number
             num = re.sub(r'[^0-9]', '', num)
             if num and num not in card_name:

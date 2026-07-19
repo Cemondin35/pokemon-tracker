@@ -81,8 +81,10 @@ PORT = int(os.environ.get("PORT", "10000"))
 LOW_RARITIES = {
     "common", "uncommon", "rare", "double rare",
     "promo", "normal", "trainer", "energy",
-    "c", "u", "r", "rr",
+    "c", "u", "r", "rr", "code",
 }
+
+SKIP_CARD_NAMES = {"code card", "energy card", "online code"}
 
 
 def _is_high_rarity(rarity: str) -> bool:
@@ -917,6 +919,9 @@ class ArbitrageEngine:
         all_rarities = set()
         for card_data in cards:
             info = PokeWalletClient.extract_card_info(card_data)
+            name_lower = (info["name"] or "").lower()
+            if any(skip in name_lower for skip in SKIP_CARD_NAMES):
+                continue
             rarity = info["rarity"]
             if rarity:
                 all_rarities.add(rarity)
@@ -978,24 +983,26 @@ class ArbitrageEngine:
             cm_price = entry["cm_price"]
 
             short_rarity = self._short_rarity(rarity or "")
-            num = card_number.split("/")[0] if "/" in card_number else card_number
-            num = re.sub(r'[^0-9]', '', num)
-            if num and num not in card_name:
-                display_name = f"{card_name} {num}"
+            num_part = card_number.split("/")[0].strip() if "/" in card_number else card_number.strip()
+            num_part = re.sub(r'[^0-9]', '', num_part)
+            clean_name = re.sub(r'\s*[-–]\s*\d+/\d+.*$', '', card_name).strip()
+            clean_name = re.sub(r'\s*[-–]\s*\d+\s*$', '', clean_name).strip()
+            if num_part and num_part not in clean_name:
+                display_name = f"{clean_name} {num_part}"
             else:
-                display_name = card_name
+                display_name = clean_name
 
             ebay_price_gbp = ebay_results[i]
             ebay_price_eur = ebay_price_gbp * GBP_TO_EUR
 
-            cm_str = f"€{cm_price:.1f}" if cm_price > 0 else "—"
-            ebay_str = f"£{ebay_price_gbp:.1f}" if ebay_price_gbp > 0 else "—"
+            cm_str = f"€{cm_price:.0f}" if cm_price > 0 else "—"
+            ebay_str = f"€{ebay_price_eur:.0f}" if ebay_price_eur > 0 else "—"
 
             if ebay_price_eur > 0 and cm_price > 0:
                 calc = self.calculator.calculate(ebay_price_gbp, cm_price)
                 profit = calc["profit_eur"]
                 icon = "🟢" if profit > 0 else "🔴"
-                profit_str = f"{icon}€{profit:+.1f}"
+                profit_str = f"{icon}€{profit:+.0f}"
             else:
                 profit_str = "—"
 
@@ -1003,7 +1010,7 @@ class ArbitrageEngine:
 
         NW = 22
         title = f"📊 {set_name}\n"
-        hdr = f"{'Kart':<{NW}} {'R':<4} {'CM':>6} {'eBay':>6} {'Fark':>8}"
+        hdr = f"{'Kart':<{NW}} {'R':<4} {'CM€':>6} {'eB€':>6} {'Kâr':>8}"
         sep = "─" * len(hdr)
 
         messages = []
@@ -1034,7 +1041,7 @@ class ArbitrageEngine:
                 messages.append(table)
 
         total_shown = len(rows)
-        footer = f"\n📈 {total_shown} kart\n🟢 CM kârlı │ 🔴 Zararlı"
+        footer = f"\n📈 {total_shown} kart (£→€ ×{GBP_TO_EUR})\n🟢 CM kârlı │ 🔴 Zararlı\nCM€=Cardmarket │ eB€=eBay(EUR)"
         if not ebay_available:
             footer += "\n\n⚠️ eBay API ayarlanmamış"
         messages[-1] += footer

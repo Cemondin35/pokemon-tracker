@@ -1043,56 +1043,65 @@ class ArbitrageEngine:
 
             rows.append((display_name, short_rarity, cm_str, ebay_str, profit_str, profitable))
 
-        NW = 16
-        title = f"📊 {set_name}\n"
-        hdr = f"{'Kart':<{NW}} {'R':>4} {'CM':>5} {'eB':>5} {'Kar':>5}"
-        sep = "-" * (NW + 4 + 5 + 5 + 5 + 4)
+        NW = 14
+        def _fmt_row(name, rar, cm_s, eb_s, pr_s):
+            esc = html_mod.escape(name)
+            if len(esc) > NW:
+                esc = esc[:NW]
+            return f"{esc:<{NW}}|{rar:^4}|{cm_s:>5}|{eb_s:>5}|{pr_s:>5}"
+
+        hdr = f"{'Kart':<{NW}}|{'R':^4}|{'CM':>5}|{'eB':>5}|{'Kar':>5}"
+        sep = "-" * NW + "+" + "-" * 4 + "+" + "-" * 5 + "+" + "-" * 5 + "+" + "-" * 5
+
+        green_rows = [r for r in rows if r[5] is True]
+        red_rows = [r for r in rows if r[5] is False]
+        nodata_rows = [r for r in rows if r[5] is None]
 
         messages = []
-        chunk_rows = []
-        chunk_len = len(title) + len(hdr) + len(sep) + 20
 
-        for name, rar, cm_s, eb_s, pr_s, profitable in rows:
-            esc_name = html_mod.escape(name)
-            if len(esc_name) > NW:
-                esc_name = esc_name[:NW - 1] + "."
-            if profitable is True:
-                mark = "+"
-            elif profitable is False:
-                mark = "-"
-            else:
-                mark = " "
-            row_line = f"{mark}{esc_name:<{NW}} {rar:>4} {cm_s:>5} {eb_s:>5} {pr_s:>5}"
-            if chunk_len + len(row_line) + 10 > 3800 and chunk_rows:
-                table = "<pre>" + "\n".join([hdr, sep] + chunk_rows) + "</pre>"
-                if not messages:
-                    messages.append(title + table)
-                else:
-                    messages.append(table)
-                chunk_rows = []
-                chunk_len = len(hdr) + len(sep) + 20
-            chunk_rows.append(row_line)
-            chunk_len += len(row_line) + 1
+        def _build_section(section_rows, limit=3800):
+            lines = []
+            cur_len = 0
+            chunks = []
+            for name, rar, cm_s, eb_s, pr_s, _ in section_rows:
+                line = _fmt_row(name, rar, cm_s, eb_s, pr_s)
+                if cur_len + len(line) + len(hdr) + len(sep) + 30 > limit and lines:
+                    chunks.append("<pre>" + "\n".join([hdr, sep] + lines) + "</pre>")
+                    lines = []
+                    cur_len = 0
+                lines.append(line)
+                cur_len += len(line) + 1
+            if lines:
+                chunks.append("<pre>" + "\n".join([hdr, sep] + lines) + "</pre>")
+            return chunks
 
-        if chunk_rows:
-            table = "<pre>" + "\n".join([hdr, sep] + chunk_rows) + "</pre>"
-            if not messages:
-                messages.append(title + table)
-            else:
-                messages.append(table)
+        title = f"📊 {set_name}\n"
+
+        if green_rows:
+            green_chunks = _build_section(green_rows)
+            green_chunks[0] = title + f"🟢 Karli ({len(green_rows)}):\n" + green_chunks[0]
+            messages.extend(green_chunks)
+
+        if red_rows:
+            red_chunks = _build_section(red_rows)
+            prefix = "" if messages else title
+            red_chunks[0] = prefix + f"🔴 Zararli ({len(red_rows)}):\n" + red_chunks[0]
+            messages.extend(red_chunks)
+
+        if nodata_rows:
+            nd_chunks = _build_section(nodata_rows)
+            prefix = "" if messages else title
+            nd_chunks[0] = prefix + f"⚪ eBay yok ({len(nodata_rows)}):\n" + nd_chunks[0]
+            messages.extend(nd_chunks)
+
+        if not messages:
+            messages = [f"❌ {set_name}: Sonuç bulunamadı."]
 
         total_shown = len(rows)
-        green = sum(1 for *_, p in rows if p is True)
-        red = sum(1 for *_, p in rows if p is False)
-        footer = f"\n📈 {total_shown} kart"
-        if green:
-            footer += f" | 🟢 {green} karli"
-        if red:
-            footer += f" | 🔴 {red} zararli"
-        footer += f"\n+ karli  - zararli  fiyatlar EUR"
-        footer += f"\nCM: %5 + €1.50 kesinti | £→€ x{GBP_TO_EUR}"
+        footer = f"\n📈 {total_shown} kart | Fiyatlar EUR"
+        footer += f"\nCM: %5 + €1.50 kesinti | GBP→EUR x{GBP_TO_EUR}"
         if not ebay_available:
-            footer += "\n\n⚠️ eBay API ayarlanmamis"
+            footer += "\n⚠️ eBay API ayarlanmamis"
         messages[-1] += footer
 
         return messages

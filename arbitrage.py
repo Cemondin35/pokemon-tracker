@@ -920,10 +920,11 @@ class ArbitrageEngine:
         lines = [f"📊 {set_name}\n"]
 
         rows = []
-        for entry in high_rarity_cards[:25]:
+        for entry in high_rarity_cards:
             info = entry["info"]
             card_name = info["name"]
             card_number = info["card_number"]
+            set_code_short = info.get("set_code", set_code)
             rarity = info["rarity"]
             cm_price = entry["cm_price"]
 
@@ -934,7 +935,7 @@ class ArbitrageEngine:
             ebay_price_eur = 0.0
             ebay_price_gbp = 0.0
             if ebay_available:
-                search_query = f"Pokemon {card_name} {card_number} {set_name}"
+                search_query = f"Pokemon {card_name} {card_number} {set_code_short}"
                 ebay_listings = await self.ebay.search_items(search_query, max_results=3)
                 await asyncio.sleep(REQUEST_DELAY)
 
@@ -957,27 +958,43 @@ class ArbitrageEngine:
             rows.append((display_name, short_rarity, cm_str, ebay_str, profit_str))
 
         NW = 22
-        table_lines = []
         hdr = f"{'Kart':<{NW}} {'R':<4} {'CM':>6} {'eBay':>6} {'Fark':>8}"
-        table_lines.append(hdr)
-        table_lines.append("─" * len(hdr))
+        sep = "─" * len(hdr)
+
+        messages = []
+        chunk_rows = []
+        chunk_len = len(lines[0]) + len(hdr) + len(sep) + 20
+
         for name, rar, cm_s, eb_s, pr_s in rows:
             esc_name = html_mod.escape(name)
             if len(esc_name) > NW:
                 esc_name = esc_name[:NW-1] + "…"
-            table_lines.append(
-                f"{esc_name:<{NW}} {rar:<4} {cm_s:>6} {eb_s:>6} {pr_s:>8}"
-            )
+            row_line = f"{esc_name:<{NW}} {rar:<4} {cm_s:>6} {eb_s:>6} {pr_s:>8}"
+            if chunk_len + len(row_line) + 10 > 3800 and chunk_rows:
+                table = "<pre>" + "\n".join([hdr, sep] + chunk_rows) + "</pre>"
+                if not messages:
+                    messages.append(lines[0] + table)
+                else:
+                    messages.append(table)
+                chunk_rows = []
+                chunk_len = len(hdr) + len(sep) + 20
+            chunk_rows.append(row_line)
+            chunk_len += len(row_line) + 1
+
+        if chunk_rows:
+            table = "<pre>" + "\n".join([hdr, sep] + chunk_rows) + "</pre>"
+            if not messages:
+                messages.append(lines[0] + table)
+            else:
+                messages.append(table)
 
         total_shown = len(rows)
-        lines.append("<pre>" + "\n".join(table_lines) + "</pre>")
-        lines.append(f"\n📈 {total_shown} kart")
-        lines.append("🟢 CM kârlı │ 🔴 Zararlı")
-
+        footer = f"\n📈 {total_shown} kart\n🟢 CM kârlı │ 🔴 Zararlı"
         if not ebay_available:
-            lines.append("\n⚠️ eBay API ayarlanmamış")
+            footer += "\n\n⚠️ eBay API ayarlanmamış"
+        messages[-1] += footer
 
-        return "\n".join(lines)
+        return messages
 
     @staticmethod
     def _short_rarity(rarity: str) -> str:
@@ -1228,8 +1245,11 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                         elif cb_data.startswith("analyze:"):
                             set_code = cb_data[8:]
                             await engine.telegram.send_text(f"🔍 {set_code} — değerli kartlar taranıyor...", cb_chat_id)
-                            table = await engine.analyze_set_table(set_code)
-                            await engine.telegram.send_html(table, cb_chat_id)
+                            messages = await engine.analyze_set_table(set_code)
+                            if isinstance(messages, str):
+                                messages = [messages]
+                            for msg in messages:
+                                await engine.telegram.send_html(msg, cb_chat_id)
                     except Exception as e:
                         print(f"[Bot] Callback error: {e}")
                         await engine.telegram.send_text(f"❌ Hata: {e}", cb_chat_id)

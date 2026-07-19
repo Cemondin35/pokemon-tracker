@@ -77,6 +77,24 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 # --- Series grouping by set_code prefix ---
 
+# High-value rarities to show in table view (skip Double Rare and below)
+HIGH_RARITIES = {
+    "illustration rare", "ir",
+    "special illustration rare", "sir",
+    "ultra rare", "ur",
+    "hyper ultra rare", "hur",
+    "hyper rare", "hr",
+    "special art rare", "sar",
+    "art rare", "ar",
+    "secret rare", "sr",
+    "full art", "fa",
+    "alt art", "aa",
+    "gold", "gold rare",
+    "trainer gallery", "tg",
+    "immersive rare",
+    "crown rare",
+}
+
 SERIES_PREFIX_MAP = {
     "SV": "Scarlet & Violet",
     "SWSH": "Sword & Shield",
@@ -97,6 +115,18 @@ SERIES_PREFIX_MAP = {
     "PGO": "Pokemon GO",
     "TG": "Trainer Gallery",
 }
+
+def _is_high_rarity(rarity: str) -> bool:
+    if not rarity:
+        return False
+    r = rarity.lower().strip()
+    if r in HIGH_RARITIES:
+        return True
+    for hr in HIGH_RARITIES:
+        if hr in r or r in hr:
+            return True
+    return False
+
 
 def _get_series_from_code(set_code: str) -> str:
     if not set_code:
@@ -778,6 +808,126 @@ class ArbitrageEngine:
         lines.append(f"\nBir seti analiz etmek için:\n/analyze <set_code>")
         return "\n".join(lines)
 
+    async def analyze_set_table(self, set_code: str) -> str:
+        """Fetch high-rarity cards from a set and return a price comparison table."""
+        cards = await self.pokewallet.get_set_cards(set_code)
+        if not cards:
+            return f"❌ {set_code}: Kart bulunamadı."
+
+        first_info = PokeWalletClient.extract_card_info(cards[0]) if cards else {}
+        set_name = first_info.get("set_name", "") or set_code
+
+        ebay_available = bool(EBAY_CLIENT_ID and EBAY_CLIENT_SECRET)
+
+        high_rarity_cards = []
+        for card_data in cards:
+            info = PokeWalletClient.extract_card_info(card_data)
+            rarity = info["rarity"]
+            if not _is_high_rarity(rarity):
+                continue
+
+            cm_price, cm_trend, cm_url = PokeWalletClient.extract_cardmarket_price(card_data)
+            if cm_price < 0.5:
+                continue
+
+            high_rarity_cards.append({
+                "info": info,
+                "cm_price": cm_price,
+                "cm_trend": cm_trend,
+                "cm_url": cm_url,
+                "card_data": card_data,
+            })
+
+        if not high_rarity_cards:
+            return f"❌ {set_name}: Yüksek rarity kart bulunamadı (IR/SIR/UR/HUR)."
+
+        high_rarity_cards.sort(key=lambda x: x["cm_price"], reverse=True)
+
+        lines = [f"📊 {set_name} — Değerli Kartlar\n"]
+        lines.append(f"{'Kart':<20} {'Rarity':<5} {'CM':>7} {'eBay':>7} {'Fark':>8}")
+        lines.append("─" * 52)
+
+        for entry in high_rarity_cards[:25]:
+            info = entry["info"]
+            card_name = info["name"]
+            card_number = info["card_number"]
+            rarity = info["rarity"]
+            cm_price = entry["cm_price"]
+
+            short_rarity = self._short_rarity(rarity)
+            display_name = f"{card_name[:17]}" if len(card_name) > 17 else card_name
+
+            ebay_price_eur = 0.0
+            ebay_price_gbp = 0.0
+            if ebay_available:
+                search_query = f"Pokemon {card_name} {card_number} {set_name}"
+                ebay_listings = await self.ebay.search_items(search_query, max_results=3)
+                await asyncio.sleep(REQUEST_DELAY)
+
+                if ebay_listings:
+                    sorted_l = sorted(ebay_listings, key=lambda x: x["total_gbp"])
+                    ebay_price_gbp = sorted_l[0]["total_gbp"]
+                    ebay_price_eur = ebay_price_gbp * GBP_TO_EUR
+
+            if ebay_price_eur > 0:
+                diff = cm_price - ebay_price_eur
+                calc = self.calculator.calculate(ebay_price_gbp, cm_price)
+                profit = calc["profit_eur"]
+                if profit >= MIN_PROFIT_EUR and calc["profit_percent"] >= MIN_PROFIT_PERCENT:
+                    icon = "🟢"
+                elif profit > 0:
+                    icon = "🟡"
+                else:
+                    icon = "🔴"
+                lines.append(
+                    f"{icon} {display_name:<18} {short_rarity:<5} "
+                    f"€{cm_price:>5.1f}  £{ebay_price_gbp:>5.1f}  "
+                    f"€{profit:>+5.1f}"
+                )
+            else:
+                lines.append(
+                    f"⚪ {display_name:<18} {short_rarity:<5} "
+                    f"€{cm_price:>5.1f}  {'—':>6}  {'—':>6}"
+                )
+
+        total_shown = min(len(high_rarity_cards), 25)
+        lines.append(f"\n📈 {total_shown} kart gösteriliyor")
+        lines.append("🟢 Kârlı | 🟡 Az kârlı | 🔴 Zarar | ⚪ eBay yok")
+
+        if not ebay_available:
+            lines.append("\n⚠️ eBay API ayarlanmamış — sadece CM fiyatları gösteriliyor")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _short_rarity(rarity: str) -> str:
+        r = rarity.lower()
+        if "special illustration" in r or r == "sir":
+            return "SIR"
+        if "illustration" in r or r == "ir":
+            return "IR"
+        if "hyper ultra" in r or r == "hur":
+            return "HUR"
+        if "hyper" in r or r == "hr":
+            return "HR"
+        if "ultra" in r or r == "ur":
+            return "UR"
+        if "special art" in r or r == "sar":
+            return "SAR"
+        if "art rare" in r or r == "ar":
+            return "AR"
+        if "secret" in r or r == "sr":
+            return "SR"
+        if "full art" in r or r == "fa":
+            return "FA"
+        if "crown" in r:
+            return "CR"
+        if "gold" in r:
+            return "GOLD"
+        if "immersive" in r:
+            return "IMR"
+        return rarity[:4].upper()
+
     async def analyze_set(self, set_code: str, force: bool = False) -> list[CardPrice]:
         if not force and self.state.is_set_recent(set_code):
             return []
@@ -997,10 +1147,9 @@ async def telegram_command_loop(engine: ArbitrageEngine):
 
                         elif cb_data.startswith("analyze:"):
                             set_code = cb_data[8:]
-                            await engine.telegram.send_text(f"🔍 {set_code} analiz ediliyor... (bu biraz sürebilir)", cb_chat_id)
-                            profitable = await engine.analyze_set(set_code, force=True)
-                            if not profitable:
-                                await engine.telegram.send_text(f"❌ {set_code}: Kârlı kart bulunamadı.", cb_chat_id)
+                            await engine.telegram.send_text(f"🔍 {set_code} — değerli kartlar taranıyor...", cb_chat_id)
+                            table = await engine.analyze_set_table(set_code)
+                            await engine.telegram.send_text(table, cb_chat_id)
                     except Exception as e:
                         print(f"[Bot] Callback error: {e}")
                         await engine.telegram.send_text(f"❌ Hata: {e}", cb_chat_id)

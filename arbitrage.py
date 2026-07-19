@@ -514,18 +514,18 @@ class ArbitrageEngine:
                 continue
 
             search_query = f"Pokemon {card_name} {card_number} {set_name}"
-            ebay_listings = await self.ebay.search_buy_it_now(search_query, max_results=5)
+            ebay_listings = await self.ebay.search_sold_listings(search_query, max_results=5)
             await asyncio.sleep(REQUEST_DELAY)
-
-            if not ebay_listings:
-                ebay_listings = await self.ebay.search_sold_listings(search_query, max_results=5)
-                await asyncio.sleep(REQUEST_DELAY)
 
             if not ebay_listings:
                 continue
 
-            cheapest = min(ebay_listings, key=lambda x: x["total_gbp"])
-            calc = self.calculator.calculate(cheapest["total_gbp"], cardmarket_price)
+            # Son 3 satışın ortalamasını al (daha gerçekçi fiyat)
+            sorted_listings = sorted(ebay_listings, key=lambda x: x["total_gbp"])
+            last_3 = sorted_listings[:3]
+            avg_total_gbp = sum(l["total_gbp"] for l in last_3) / len(last_3)
+            cheapest = last_3[0]  # link ve resim için en ucuzunu kullan
+            calc = self.calculator.calculate(avg_total_gbp, cardmarket_price)
 
             if calc["is_profitable"]:
                 card_price = CardPrice(
@@ -580,21 +580,25 @@ class ArbitrageEngine:
             return f"❌ {name}: Cardmarket fiyatı çok düşük (€{cardmarket_price:.2f})"
 
         search_query = f"Pokemon {name} {number}"
-        ebay_listings = await self.ebay.search_buy_it_now(search_query, max_results=5)
-        if not ebay_listings:
-            ebay_listings = await self.ebay.search_sold_listings(search_query, max_results=5)
+        ebay_listings = await self.ebay.search_sold_listings(search_query, max_results=5)
 
         if not ebay_listings:
-            return f"❌ {name}: eBay UK'de bulunamadı."
+            return f"❌ {name}: eBay UK sold listings'de bulunamadı."
 
-        cheapest = min(ebay_listings, key=lambda x: x["total_gbp"])
-        calc = self.calculator.calculate(cheapest["total_gbp"], cardmarket_price)
+        # Son 3 satışın ortalaması
+        sorted_listings = sorted(ebay_listings, key=lambda x: x["total_gbp"])
+        last_3 = sorted_listings[:3]
+        avg_total_gbp = sum(l["total_gbp"] for l in last_3) / len(last_3)
+        cheapest = last_3[0]
+        calc = self.calculator.calculate(avg_total_gbp, cardmarket_price)
 
         status = "✅ KÂRLI" if calc["is_profitable"] else "❌ Kârsız"
+        sold_info = " / ".join([f"£{l['total_gbp']:.2f}" for l in last_3])
         return (
             f"{status}\n\n"
             f"🃏 {name} #{number} ({set_name})\n"
-            f"🇬🇧 eBay UK: £{cheapest['total_gbp']:.2f} (€{calc['total_cost_eur']:.2f})\n"
+            f"🇬🇧 eBay UK Son Satışlar: {sold_info}\n"
+            f"🇬🇧 Ortalama: £{avg_total_gbp:.2f} (€{calc['total_cost_eur']:.2f})\n"
             f"🇪🇺 Cardmarket: €{cardmarket_price:.2f}\n"
             f"💵 Satış sonrası: €{calc['selling_price_after_fees_eur']:.2f}\n"
             f"💰 Kâr: €{calc['profit_eur']:.2f} ({calc['profit_percent']:.1f}%)\n"

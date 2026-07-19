@@ -13,11 +13,29 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 import httpx
 from bs4 import BeautifulSoup
+
+
+# --- Load .env file ---
+
+def load_env():
+    """Load variables from .env file if it exists."""
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                os.environ.setdefault(key.strip(), value.strip())
+
+load_env()
 
 
 # --- Configuration ---

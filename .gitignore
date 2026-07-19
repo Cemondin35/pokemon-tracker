@@ -1,0 +1,14 @@
+# Environment variables (API keys, tokens)
+.env
+
+# State files
+arbitrage_state.json
+arbitrage_results.json
+state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/

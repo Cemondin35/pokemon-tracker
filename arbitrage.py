@@ -77,22 +77,11 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 # --- Series grouping by set_code prefix ---
 
-# High-value rarities to show in table view (skip Double Rare and below)
-HIGH_RARITIES = {
-    "illustration rare", "ir",
-    "special illustration rare", "sir",
-    "ultra rare", "ur",
-    "hyper ultra rare", "hur",
-    "hyper rare", "hr",
-    "special art rare", "sar",
-    "art rare", "ar",
-    "secret rare", "sr",
-    "full art", "fa",
-    "alt art", "aa",
-    "gold", "gold rare",
-    "trainer gallery", "tg",
-    "immersive rare",
-    "crown rare",
+# Low-value rarities to SKIP in table view (everything else is shown)
+LOW_RARITIES = {
+    "common", "uncommon", "rare", "double rare",
+    "promo", "normal", "trainer", "energy",
+    "c", "u", "r", "rr",
 }
 
 SERIES_PREFIX_MAP = {
@@ -120,12 +109,12 @@ def _is_high_rarity(rarity: str) -> bool:
     if not rarity:
         return False
     r = rarity.lower().strip()
-    if r in HIGH_RARITIES:
-        return True
-    for hr in HIGH_RARITIES:
-        if hr in r or r in hr:
-            return True
-    return False
+    if r in LOW_RARITIES:
+        return False
+    for lr in LOW_RARITIES:
+        if r == lr:
+            return False
+    return True
 
 
 def _get_series_from_code(set_code: str) -> str:
@@ -764,6 +753,12 @@ class ArbitrageEngine:
         if not filtered:
             return f"❌ '{series_filter}' serisi bulunamadı.", []
 
+        skip_words = {"energies", "energy", "deck", "sleeves", "box", "tin", "collection"}
+        filtered = [
+            s for s in filtered
+            if not any(w in (s.get("name") or "").lower() for w in skip_words)
+        ]
+
         sets_sorted = sorted(filtered, key=lambda s: _parse_date(s), reverse=True)
 
         buttons = []
@@ -820,9 +815,12 @@ class ArbitrageEngine:
         ebay_available = bool(EBAY_CLIENT_ID and EBAY_CLIENT_SECRET)
 
         high_rarity_cards = []
+        all_rarities = set()
         for card_data in cards:
             info = PokeWalletClient.extract_card_info(card_data)
             rarity = info["rarity"]
+            if rarity:
+                all_rarities.add(rarity)
             if not _is_high_rarity(rarity):
                 continue
 
@@ -838,8 +836,11 @@ class ArbitrageEngine:
                 "card_data": card_data,
             })
 
+        print(f"[Table] {set_name}: rarities found: {all_rarities}")
+
         if not high_rarity_cards:
-            return f"❌ {set_name}: Yüksek rarity kart bulunamadı (IR/SIR/UR/HUR)."
+            rarity_list = ", ".join(sorted(all_rarities)) if all_rarities else "bilinmiyor"
+            return f"❌ {set_name}: Değerli kart bulunamadı.\nMevcut rarity'ler: {rarity_list}"
 
         high_rarity_cards.sort(key=lambda x: x["cm_price"], reverse=True)
 

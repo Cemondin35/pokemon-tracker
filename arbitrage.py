@@ -1257,7 +1257,13 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                         elif cb_data.startswith("analyze:"):
                             set_code = cb_data[8:]
                             await engine.telegram.send_text(f"🔍 {set_code} — değerli kartlar taranıyor...", cb_chat_id)
-                            messages = await engine.analyze_set_table(set_code)
+                            try:
+                                messages = await asyncio.wait_for(
+                                    engine.analyze_set_table(set_code), timeout=300,
+                                )
+                            except asyncio.TimeoutError:
+                                await engine.telegram.send_text(f"⏰ {set_code} — zaman aşımı (5dk). Çok fazla kart olabilir.", cb_chat_id)
+                                continue
                             if isinstance(messages, str):
                                 messages = [messages]
                             for msg in messages:

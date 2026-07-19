@@ -144,40 +144,52 @@ class PokeWalletClient:
             return []
 
     async def get_set_cards(self, set_id: str) -> list[dict]:
-        # Try multiple endpoint patterns
+        # Try multiple endpoint patterns (PokéWallet + pokemontcg.io style)
         endpoints = [
-            f"{self.base_url}/sets/{set_id}/cards",
-            f"{self.base_url}/cards?set={set_id}",
-            f"{self.base_url}/cards?set.id={set_id}",
+            (f"{self.base_url}/cards?q=set.id:{set_id}", self.headers),
+            (f"{self.base_url}/sets/{set_id}/cards", self.headers),
+            (f"{self.base_url}/cards?set={set_id}", self.headers),
+            (f"{self.base_url}/cards?set.name:{set_id}", self.headers),
+            # Fallback: pokemontcg.io (free, no key needed)
+            (f"https://api.pokemontcg.io/v2/cards?q=set.id:{set_id}&select=name,number,rarity,images,set,cardmarket", {}),
         ]
-        for url in endpoints:
+        for url, headers in endpoints:
             try:
-                resp = await self.client.get(url, headers=self.headers, timeout=30)
-                print(f"[PokeWallet] GET {url.replace(self.base_url, '')} -> {resp.status_code}")
+                resp = await self.client.get(url, headers=headers, timeout=30)
+                short_url = url.replace(self.base_url, "").replace("https://api.pokemontcg.io/v2", "[ptcg]")
+                print(f"[API] GET {short_url} -> {resp.status_code}")
                 if resp.status_code == 200:
                     data = resp.json()
                     items = data if isinstance(data, list) else data.get("data", data.get("cards", []))
                     if items:
+                        print(f"[API] Found {len(items)} cards")
                         return items
             except Exception as e:
-                print(f"[PokeWallet] Error: {e}")
+                print(f"[API] Error: {e}")
+        print(f"[API] No cards found for set {set_id}")
         return []
 
     async def search_card(self, name: str, set_name: str = "") -> list[dict]:
-        params = {"q": name}
-        if set_name:
-            params["set"] = set_name
-        try:
-            resp = await self.client.get(
-                f"{self.base_url}/cards", params=params, headers=self.headers, timeout=30
-            )
-            print(f"[PokeWallet] GET /cards?q={name} -> {resp.status_code}")
-            resp.raise_for_status()
-            data = resp.json()
-            return data if isinstance(data, list) else data.get("data", data.get("cards", []))
-        except Exception as e:
-            print(f"[PokeWallet] Error searching card '{name}': {e}")
-            return []
+        # Try PokéWallet first, then pokemontcg.io
+        queries = [
+            (f"{self.base_url}/cards?q=name:{name}", self.headers),
+            (f"{self.base_url}/cards?q={name}", self.headers),
+            (f"https://api.pokemontcg.io/v2/cards?q=name:\"{name}\"&select=name,number,rarity,images,set,cardmarket", {}),
+        ]
+        for url, headers in queries:
+            try:
+                resp = await self.client.get(url, headers=headers, timeout=30)
+                short_url = url.split("?")[0].replace(self.base_url, "").replace("https://api.pokemontcg.io/v2", "[ptcg]")
+                print(f"[API] Search '{name}' -> {resp.status_code}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = data if isinstance(data, list) else data.get("data", data.get("cards", []))
+                    if items:
+                        print(f"[API] Found {len(items)} results")
+                        return items
+            except Exception as e:
+                print(f"[API] Search error: {e}")
+        return []
 
 
 # --- eBay UK Scraper ---
@@ -544,13 +556,19 @@ class ArbitrageEngine:
             card_name = card_data.get("name", "Unknown")
             card_number = card_data.get("number", card_data.get("card_number", ""))
             rarity = card_data.get("rarity", "")
-            image_url = card_data.get("image", card_data.get("images", {}).get("small", ""))
+            images = card_data.get("images", {})
+            image_url = card_data.get("image") or images.get("small") or images.get("large") or ""
 
-            prices = card_data.get("prices", card_data.get("cardmarket", {}))
+            # Extract Cardmarket price (handles both PokéWallet and pokemontcg.io formats)
+            cardmarket_data = card_data.get("cardmarket", {})
+            prices = cardmarket_data.get("prices", card_data.get("prices", {}))
             cardmarket_price = 0.0
             if isinstance(prices, dict):
                 cm = prices.get("cardmarket", prices)
-                cardmarket_price = float(cm.get("trendPrice", cm.get("trend", cm.get("price", 0))) or 0)
+                cardmarket_price = float(
+                    cm.get("trendPrice") or cm.get("averageSellPrice") or
+                    cm.get("trend") or cm.get("price") or 0
+                )
 
             if cardmarket_price < 1.0:
                 continue
@@ -610,13 +628,18 @@ class ArbitrageEngine:
         number = card_data.get("number", "")
         set_info = card_data.get("set", {})
         set_name = set_info.get("name", "")
-        image_url = card_data.get("image", card_data.get("images", {}).get("small", ""))
+        images = card_data.get("images", {})
+        image_url = card_data.get("image") or images.get("small") or images.get("large") or ""
 
-        prices = card_data.get("prices", card_data.get("cardmarket", {}))
+        cardmarket_data = card_data.get("cardmarket", {})
+        prices = cardmarket_data.get("prices", card_data.get("prices", {}))
         cardmarket_price = 0.0
         if isinstance(prices, dict):
             cm = prices.get("cardmarket", prices)
-            cardmarket_price = float(cm.get("trendPrice", cm.get("trend", cm.get("price", 0))) or 0)
+            cardmarket_price = float(
+                cm.get("trendPrice") or cm.get("averageSellPrice") or
+                cm.get("trend") or cm.get("price") or 0
+            )
 
         if cardmarket_price < 0.5:
             return f"❌ {name}: Cardmarket fiyatı çok düşük (€{cardmarket_price:.2f})"

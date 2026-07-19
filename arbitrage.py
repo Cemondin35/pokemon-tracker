@@ -127,6 +127,33 @@ class PokeWalletClient:
             self.headers["X-API-Key"] = POKEWALLET_API_KEY
 
     async def get_sets(self) -> list[dict]:
+        # Use pokemontcg.io as primary — it has series, proper IDs, releaseDate
+        try:
+            page = 1
+            all_sets = []
+            while True:
+                resp = await self.client.get(
+                    f"https://api.pokemontcg.io/v2/sets?orderBy=-releaseDate&page={page}&pageSize=250",
+                    headers={}, timeout=30,
+                )
+                print(f"[ptcg] GET /sets page={page} -> {resp.status_code}")
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                items = data.get("data", [])
+                if not items:
+                    break
+                all_sets.extend(items)
+                if len(items) < 250:
+                    break
+                page += 1
+            if all_sets:
+                print(f"[ptcg] Total sets: {len(all_sets)}")
+                return all_sets
+        except Exception as e:
+            print(f"[ptcg] Sets error: {e}")
+
+        # Fallback to PokéWallet
         try:
             resp = await self.client.get(
                 f"{self.base_url}/sets", headers=self.headers, timeout=30
@@ -135,97 +162,98 @@ class PokeWalletClient:
             resp.raise_for_status()
             data = resp.json()
             items = data if isinstance(data, list) else data.get("data", data.get("sets", []))
-            if items:
-                print(f"[PokeWallet] Sample set keys: {list(items[0].keys())}")
-                print(f"[PokeWallet] Sample set: {json.dumps(items[0], default=str)[:500]}")
             return items
         except Exception as e:
             print(f"[PokeWallet] Error fetching sets: {e}")
             return []
 
     async def get_set_cards(self, set_id: str, set_name: str = "") -> list[dict]:
-        endpoints = [
-            (f"{self.base_url}/cards?q=set.id:{set_id}", self.headers),
-            (f"{self.base_url}/sets/{set_id}/cards", self.headers),
-            (f"{self.base_url}/cards?set={set_id}", self.headers),
-            (f"https://api.pokemontcg.io/v2/cards?q=set.id:{set_id}&select=name,number,rarity,images,set,cardmarket", {}),
-        ]
-        for url, headers in endpoints:
+        # pokemontcg.io first (since our sets listing uses ptcg IDs)
+        all_cards = []
+        page = 1
+        try:
+            while True:
+                url = f"https://api.pokemontcg.io/v2/cards?q=set.id:{set_id}&select=name,number,rarity,images,set,cardmarket&pageSize=250&page={page}"
+                resp = await self.client.get(url, headers={}, timeout=30)
+                print(f"[ptcg] cards set.id:{set_id} page={page} -> {resp.status_code}")
+                if resp.status_code == 200:
+                    items = resp.json().get("data", [])
+                    if items:
+                        all_cards.extend(items)
+                        if len(items) < 250:
+                            break
+                        page += 1
+                        continue
+                break
+        except Exception as e:
+            print(f"[ptcg] Cards error: {e}")
+
+        if all_cards:
+            print(f"[ptcg] Total cards for {set_id}: {len(all_cards)}")
+            return all_cards
+
+        # Fallback: search by set name
+        if set_name:
             try:
-                resp = await self.client.get(url, headers=headers, timeout=30)
-                short_url = url.replace(self.base_url, "").replace("https://api.pokemontcg.io/v2", "[ptcg]")
-                print(f"[API] GET {short_url} -> {resp.status_code}")
+                url = f"https://api.pokemontcg.io/v2/cards?q=set.name:\"{set_name}\"&select=name,number,rarity,images,set,cardmarket&pageSize=250"
+                resp = await self.client.get(url, headers={}, timeout=30)
+                print(f"[ptcg] cards by name '{set_name}' -> {resp.status_code}")
+                if resp.status_code == 200:
+                    items = resp.json().get("data", [])
+                    if items:
+                        print(f"[ptcg] Found {len(items)} cards by name")
+                        return items
+            except Exception as e:
+                print(f"[ptcg] Name search error: {e}")
+
+        # Last fallback: PokéWallet
+        for url in [
+            f"{self.base_url}/cards?q=set.id:{set_id}",
+            f"{self.base_url}/sets/{set_id}/cards",
+        ]:
+            try:
+                resp = await self.client.get(url, headers=self.headers, timeout=30)
+                print(f"[PW] {url.replace(self.base_url, '')} -> {resp.status_code}")
                 if resp.status_code == 200:
                     data = resp.json()
                     items = data if isinstance(data, list) else data.get("data", data.get("cards", []))
                     if items:
-                        print(f"[API] Found {len(items)} cards")
                         return items
             except Exception as e:
-                print(f"[API] Error: {e}")
-
-        # Last resort: search pokemontcg.io by set name
-        if set_name:
-            try:
-                url = f"https://api.pokemontcg.io/v2/cards?q=set.name:\"{set_name}\"&select=name,number,rarity,images,set,cardmarket&pageSize=50"
-                resp = await self.client.get(url, headers={}, timeout=30)
-                print(f"[API] ptcg name search '{set_name}' -> {resp.status_code}")
-                if resp.status_code == 200:
-                    items = resp.json().get("data", [])
-                    if items:
-                        print(f"[API] Found {len(items)} cards by name")
-                        return items
-            except Exception as e:
-                print(f"[API] Name search error: {e}")
-
-        # Try to resolve set_id via pokemontcg.io sets endpoint
-        try:
-            resp = await self.client.get(
-                f"https://api.pokemontcg.io/v2/sets?q=id:{set_id} OR ptcgoCode:{set_id}",
-                headers={}, timeout=30,
-            )
-            if resp.status_code == 200:
-                set_data = resp.json().get("data", [])
-                if set_data:
-                    real_id = set_data[0].get("id", "")
-                    real_name = set_data[0].get("name", "")
-                    print(f"[API] Resolved set: {set_id} -> {real_id} ({real_name})")
-                    if real_id and real_id != set_id:
-                        resp2 = await self.client.get(
-                            f"https://api.pokemontcg.io/v2/cards?q=set.id:{real_id}&select=name,number,rarity,images,set,cardmarket&pageSize=100",
-                            headers={}, timeout=30,
-                        )
-                        if resp2.status_code == 200:
-                            items = resp2.json().get("data", [])
-                            if items:
-                                print(f"[API] Found {len(items)} cards via resolved ID")
-                                return items
-        except Exception as e:
-            print(f"[API] Set resolve error: {e}")
+                print(f"[PW] Error: {e}")
 
         print(f"[API] No cards found for set {set_id}")
         return []
 
     async def search_card(self, name: str, set_name: str = "") -> list[dict]:
-        # Try PokéWallet first, then pokemontcg.io
-        queries = [
-            (f"{self.base_url}/cards?q=name:{name}", self.headers),
-            (f"{self.base_url}/cards?q={name}", self.headers),
-            (f"https://api.pokemontcg.io/v2/cards?q=name:\"{name}\"&select=name,number,rarity,images,set,cardmarket", {}),
-        ]
-        for url, headers in queries:
+        # pokemontcg.io first (better data, free, no key)
+        try:
+            url = f"https://api.pokemontcg.io/v2/cards?q=name:\"{name}\"&select=name,number,rarity,images,set,cardmarket&pageSize=10"
+            resp = await self.client.get(url, headers={}, timeout=30)
+            print(f"[ptcg] Search '{name}' -> {resp.status_code}")
+            if resp.status_code == 200:
+                items = resp.json().get("data", [])
+                if items:
+                    print(f"[ptcg] Found {len(items)} results")
+                    return items
+        except Exception as e:
+            print(f"[ptcg] Search error: {e}")
+
+        # Fallback: PokéWallet
+        for url in [
+            f"{self.base_url}/cards?q=name:{name}",
+            f"{self.base_url}/cards?q={name}",
+        ]:
             try:
-                resp = await self.client.get(url, headers=headers, timeout=30)
-                short_url = url.split("?")[0].replace(self.base_url, "").replace("https://api.pokemontcg.io/v2", "[ptcg]")
-                print(f"[API] Search '{name}' -> {resp.status_code}")
+                resp = await self.client.get(url, headers=self.headers, timeout=30)
+                print(f"[PW] Search '{name}' -> {resp.status_code}")
                 if resp.status_code == 200:
                     data = resp.json()
                     items = data if isinstance(data, list) else data.get("data", data.get("cards", []))
                     if items:
-                        print(f"[API] Found {len(items)} results")
                         return items
             except Exception as e:
-                print(f"[API] Search error: {e}")
+                print(f"[PW] Search error: {e}")
         return []
 
 
@@ -331,16 +359,14 @@ class EbayUKScraper:
 # --- Date Parser ---
 
 def _parse_date(s: dict) -> str:
-    """Parse dates like '9th September, 2022' into sortable '2022-09-09' format."""
+    """Parse various date formats into sortable 'YYYY-MM-DD'."""
     from datetime import datetime
     raw = s.get("releaseDate") or s.get("release_date") or ""
     if not raw:
         return "0000-00-00"
     try:
-        # Try ISO format first (2022-09-09)
-        if re.match(r"\d{4}-\d{2}-\d{2}", raw):
-            return raw[:10]
-        # Parse "9th September, 2022" style
+        if re.match(r"\d{4}[-/]\d{2}[-/]\d{2}", raw):
+            return raw[:10].replace("/", "-")
         cleaned = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", raw)
         dt = datetime.strptime(cleaned.strip(), "%d %B, %Y")
         return dt.strftime("%Y-%m-%d")

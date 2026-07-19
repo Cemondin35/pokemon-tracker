@@ -1,1 +1,1 @@
-web: python arbitrage.py serve
+web: python -u arbitrage.py serve

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 -u
 """
 Pokemon Card Arbitrage System
 Buy from eBay UK → Sell on Cardmarket for profit.
@@ -77,7 +77,7 @@ RESULTS_FILE = "arbitrage_results.json"
 REQUEST_DELAY = 2
 
 # Health check port (Render needs this)
-PORT = int(os.environ.get("PORT", "8080"))
+PORT = int(os.environ.get("PORT", "10000"))
 
 
 @dataclass

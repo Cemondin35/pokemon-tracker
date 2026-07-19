@@ -524,21 +524,63 @@ class ArbitrageEngine:
         if self.client:
             await self.client.aclose()
 
-    async def list_sets(self) -> str:
+    async def list_series(self) -> str:
+        """List all series/eras (newest first)."""
+        sets = await self.pokewallet.get_sets()
+        if not sets:
+            return "❌ Seri listesi alınamadı."
+
+        # Group by series
+        series_map = {}
+        for s in sets:
+            series = s.get("series") or s.get("set_series") or "Diğer"
+            if series not in series_map:
+                series_map[series] = {"sets": [], "latest_date": "0000-00-00"}
+            series_map[series]["sets"].append(s)
+            d = _parse_date(s)
+            if d > series_map[series]["latest_date"]:
+                series_map[series]["latest_date"] = d
+
+        # Sort series by latest set date (newest first)
+        sorted_series = sorted(series_map.items(), key=lambda x: x[1]["latest_date"], reverse=True)
+
+        lines = ["📚 SERİLER (en yeniden eskiye):\n"]
+        for i, (name, info) in enumerate(sorted_series, 1):
+            count = len(info["sets"])
+            lines.append(f"{i}. {name} ({count} set)")
+        lines.append(f"\nBir serinin setlerini görmek için:\n/sets <seri adı>\nÖrn: /sets Scarlet & Violet")
+        return "\n".join(lines)
+
+    async def list_sets(self, series_filter: str = "") -> str:
+        """List sets, optionally filtered by series."""
         sets = await self.pokewallet.get_sets()
         if not sets:
             return "❌ Set listesi alınamadı."
+
+        # Filter by series if provided
+        if series_filter:
+            filter_lower = series_filter.lower()
+            filtered = [s for s in sets if filter_lower in (s.get("series") or s.get("set_series") or "").lower()]
+            if not filtered:
+                # Try matching set name too
+                filtered = [s for s in sets if filter_lower in (s.get("name") or "").lower()]
+            if not filtered:
+                return f"❌ '{series_filter}' serisi bulunamadı. /series ile serileri listele."
+            sets = filtered
+
         # En yeni setler önce
         sets_sorted = sorted(sets, key=lambda s: _parse_date(s), reverse=True)
-        lines = [f"📦 {len(sets)} set bulundu (en yeniden eskiye):\n"]
-        for i, s in enumerate(sets_sorted[:20], 1):
+        title = f"📦 {series_filter}" if series_filter else "📦 Tüm setler"
+        lines = [f"{title} ({len(sets)} set, en yeniden eskiye):\n"]
+        for i, s in enumerate(sets_sorted[:25], 1):
             name = s.get("name", "?")
             sid = s.get("id", s.get("set_id", ""))
             total = s.get("total", s.get("totalCards", "?"))
             date = s.get("releaseDate") or s.get("release_date") or ""
             lines.append(f"{i}. [{sid}] {name} ({total} kart) {date}")
-        if len(sets) > 20:
-            lines.append(f"\n...ve {len(sets) - 20} set daha")
+        if len(sets) > 25:
+            lines.append(f"\n...ve {len(sets) - 25} set daha")
+        lines.append(f"\nBir seti analiz etmek için:\n/analyze <set_id>")
         return "\n".join(lines)
 
     async def analyze_set(self, set_id: str, force: bool = False) -> list[CardPrice]:
@@ -706,8 +748,13 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                 if chat_id != TELEGRAM_CHAT_ID:
                     continue
 
-                if text.startswith("/sets"):
-                    result = await engine.list_sets()
+                if text.startswith("/series"):
+                    result = await engine.list_series()
+                    await engine.telegram.send_text(result)
+
+                elif text.startswith("/sets"):
+                    series_filter = text.replace("/sets", "").strip()
+                    result = await engine.list_sets(series_filter)
                     await engine.telegram.send_text(result)
 
                 elif text.startswith("/analyze"):
@@ -745,12 +792,18 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                 elif text.startswith("/help"):
                     await engine.telegram.send_text(
                         "🃏 Pokemon Arbitrage Bot\n\n"
-                        "/sets - Tüm setleri listele\n"
+                        "/series - Tüm serileri listele\n"
+                        "/sets <seri adı> - Serinin setlerini göster\n"
                         "/analyze <set_id> - Set analiz et\n"
                         "/check <kart adı> - Tek kart kontrol\n"
                         "/results - En kârlı kartlar\n"
                         "/status - Bot durumu\n"
-                        "/help - Bu mesaj"
+                        "/help - Bu mesaj\n\n"
+                        "Örnek:\n"
+                        "/series\n"
+                        "/sets Scarlet & Violet\n"
+                        "/analyze sv6\n"
+                        "/check Charizard ex"
                     )
 
                 elif text.startswith("/status"):

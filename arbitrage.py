@@ -871,6 +871,7 @@ class ArbitrageEngine:
         first_info = PokeWalletClient.extract_card_info(cards[0]) if cards else {}
         set_name = first_info.get("set_name", "") or set_code
 
+        is_promo = "promo" in set_name.lower() or "promo" in set_code.lower()
         ebay_available = bool(EBAY_CLIENT_ID and EBAY_CLIENT_SECRET)
 
         high_rarity_cards = []
@@ -880,7 +881,7 @@ class ArbitrageEngine:
             rarity = info["rarity"]
             if rarity:
                 all_rarities.add(rarity)
-            if not _is_high_rarity(rarity):
+            if not is_promo and not _is_high_rarity(rarity):
                 continue
 
             cm_price, cm_trend, cm_url = PokeWalletClient.extract_cardmarket_price(card_data)
@@ -930,7 +931,11 @@ class ArbitrageEngine:
 
             short_rarity = self._short_rarity(rarity)
             num = card_number.split("/")[0] if "/" in card_number else card_number
-            display_name = f"{card_name} {num}"
+            num = re.sub(r'[^0-9]', '', num)
+            if num and num not in card_name:
+                display_name = f"{card_name} {num}"
+            else:
+                display_name = card_name
 
             ebay_price_eur = 0.0
             ebay_price_gbp = 0.0

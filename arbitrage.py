@@ -1103,69 +1103,96 @@ async def telegram_command_loop(engine: ArbitrageEngine):
 
                 elif text.startswith("/diag"):
                     await engine.telegram.send_text("🔧 Tanılama çalışıyor...", chat_id)
-                    diag_lines = []
                     cl = engine.client
                     pw_headers = engine.pokewallet.headers
                     pw_base = engine.pokewallet.base_url
 
-                    # Test 1: PokéWallet /sets — first set structure
+                    # Test 1: PokéWallet /search full result
+                    d = []
                     try:
-                        resp = await cl.get(f"{pw_base}/sets", headers=pw_headers, timeout=30)
-                        diag_lines.append(f"PW /sets: HTTP {resp.status_code}")
+                        resp = await cl.get(f"{pw_base}/search?q=Charizard ex", headers=pw_headers, timeout=30)
+                        d.append(f"/search?q=Charizard ex → {resp.status_code}")
                         if resp.status_code == 200:
                             data = resp.json()
-                            items = data if isinstance(data, list) else data.get("data", data.get("sets", []))
-                            diag_lines.append(f"  {len(items)} set")
-                            if items:
-                                s = items[0]
-                                diag_lines.append(f"  Keys: {list(s.keys())}")
-                                diag_lines.append(f"  Sample: {json.dumps(s, default=str)[:300]}")
+                            d.append(f"Top keys: {list(data.keys())}")
+                            results = data.get("results", data.get("data", []))
+                            d.append(f"Results count: {len(results)}")
+                            if results:
+                                r = results[0]
+                                d.append(f"Result keys: {list(r.keys())}")
+                                d.append(f"Result[0]: {json.dumps(r, default=str)[:500]}")
+                                if len(results) > 1:
+                                    d.append(f"Result[1]: {json.dumps(results[1], default=str)[:300]}")
                     except Exception as e:
-                        diag_lines.append(f"PW /sets hata: {e}")
+                        d.append(f"Hata: {e}")
+                    await engine.telegram.send_text("🔧 PW /search\n\n" + "\n".join(d), chat_id)
 
-                    await engine.telegram.send_text("🔧 PokéWallet Sets\n\n" + "\n".join(diag_lines), chat_id)
-                    diag_lines = []
-
-                    # Test 2: PokéWallet card endpoints — try many patterns
-                    test_endpoints = [
-                        f"{pw_base}/cards?q=name:Charizard",
-                        f"{pw_base}/cards?name=Charizard",
-                        f"{pw_base}/cards/search?q=Charizard",
-                        f"{pw_base}/search?q=Charizard",
-                        f"{pw_base}/card?name=Charizard",
-                        f"{pw_base}/sets/sv6/cards",
-                        f"{pw_base}/sets/sv6",
-                        f"{pw_base}/cards?set=sv6",
-                        f"{pw_base}/cards?set.id=sv6",
-                    ]
-                    for ep in test_endpoints:
+                    # Test 2: PokéWallet /sets/SV6 full response
+                    d = []
+                    for code in ["SV6", "sv6", "SV1"]:
                         try:
-                            resp = await cl.get(ep, headers=pw_headers, timeout=15)
-                            short = ep.replace(pw_base, "")
-                            status = resp.status_code
-                            body = ""
-                            if status == 200:
-                                body = resp.text[:150]
-                            diag_lines.append(f"{short} → {status} {body[:100]}")
+                            resp = await cl.get(f"{pw_base}/sets/{code}", headers=pw_headers, timeout=15)
+                            d.append(f"/sets/{code} → {resp.status_code}")
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                d.append(f"Keys: {list(data.keys())}")
+                                d.append(f"Data: {json.dumps(data, default=str)[:400]}")
                         except Exception as e:
-                            diag_lines.append(f"{ep.replace(pw_base,'')} → ERR {e}")
+                            d.append(f"/sets/{code} → ERR {e}")
+                    await engine.telegram.send_text("🔧 PW /sets/{code}\n\n" + "\n".join(d), chat_id)
 
-                    await engine.telegram.send_text("🔧 PokéWallet Endpoints\n\n" + "\n".join(diag_lines), chat_id)
-                    diag_lines = []
-
-                    # Test 3: eBay
+                    # Test 3: PokéWallet card detail + price endpoints
+                    d = []
                     try:
-                        listings = await engine.ebay.search_sold_listings("Pokemon Charizard ex", max_results=3)
-                        if listings:
-                            diag_lines.append(f"✅ eBay sold: {len(listings)} sonuç")
-                            for l in listings[:2]:
-                                diag_lines.append(f"  £{l['total_gbp']:.2f} - {l['title'][:40]}")
-                        else:
-                            diag_lines.append("❌ eBay sold: 0 sonuç (CAPTCHA/blok)")
+                        resp = await cl.get(f"{pw_base}/search?q=Charizard ex", headers=pw_headers, timeout=30)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            results = data.get("results", data.get("data", []))
+                            if results:
+                                card_id = results[0].get("id", "")
+                                slug = results[0].get("slug", results[0].get("url", ""))
+                                d.append(f"Card ID: {card_id}")
+                                d.append(f"Slug: {slug}")
+                                # Try card detail endpoints
+                                for ep in [
+                                    f"{pw_base}/card/{card_id}",
+                                    f"{pw_base}/cards/{card_id}",
+                                    f"{pw_base}/card/{card_id}/prices",
+                                    f"{pw_base}/prices/{card_id}",
+                                    f"{pw_base}/product/{card_id}",
+                                ]:
+                                    try:
+                                        r2 = await cl.get(ep, headers=pw_headers, timeout=15)
+                                        short = ep.replace(pw_base, "")
+                                        body = r2.text[:200] if r2.status_code == 200 else ""
+                                        d.append(f"{short} → {r2.status_code} {body}")
+                                    except Exception as e2:
+                                        d.append(f"{ep.replace(pw_base,'')} → ERR")
                     except Exception as e:
-                        diag_lines.append(f"❌ eBay hata: {e}")
+                        d.append(f"Hata: {e}")
+                    await engine.telegram.send_text("🔧 PW Card Detail\n\n" + "\n".join(d), chat_id)
 
-                    await engine.telegram.send_text("🔧 eBay Test\n\n" + "\n".join(diag_lines), chat_id)
+                    # Test 4: More PokéWallet endpoints
+                    d = []
+                    for ep in [
+                        f"{pw_base}/",
+                        f"{pw_base}/api",
+                        f"{pw_base}/docs",
+                        f"{pw_base}/v1/sets",
+                        f"{pw_base}/v2/sets",
+                        f"{pw_base}/set/SV6/cards",
+                        f"{pw_base}/set/SV6",
+                        f"{pw_base}/search?q=SV6&type=set",
+                        f"{pw_base}/sets?series=Scarlet",
+                    ]:
+                        try:
+                            r = await cl.get(ep, headers=pw_headers, timeout=10)
+                            short = ep.replace(pw_base, "")
+                            body = r.text[:120] if r.status_code == 200 else ""
+                            d.append(f"{short} → {r.status_code} {body[:100]}")
+                        except Exception as e:
+                            d.append(f"{ep.replace(pw_base,'')} → ERR")
+                    await engine.telegram.send_text("🔧 PW Other Endpoints\n\n" + "\n".join(d), chat_id)
 
                 elif text.startswith("/help"):
                     await engine.telegram.send_text(

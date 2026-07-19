@@ -436,8 +436,8 @@ class EbayBrowseAPI:
             params = {
                 "q": query,
                 "category_ids": "183454",
-                "filter": "buyingOptions:{FIXED_PRICE},itemLocationCountry:GB",
-                "sort": "newlyListed",
+                "filter": "buyingOptions:{FIXED_PRICE}",
+                "sort": "price",
                 "limit": str(min(max_results, 50)),
             }
             resp = await self.client.get(
@@ -455,13 +455,15 @@ class EbayBrowseAPI:
             if resp.status_code == 200:
                 data = resp.json()
                 items = data.get("itemSummaries", [])
-                return self._normalize_items(items)
+                total = data.get("total", 0)
+                normalized = self._normalize_items(items)
+                print(f"[eBay] Found {total} raw, {len(items)} returned, {len(normalized)} after filter")
+                return normalized
             elif resp.status_code == 429:
-                print("[eBay] Rate limited - waiting")
-                await asyncio.sleep(5)
+                print("[eBay] Rate limited")
                 return []
             else:
-                print(f"[eBay] Search error: {resp.text[:300]}")
+                print(f"[eBay] Search error {resp.status_code}: {resp.text[:200]}")
                 return []
         except Exception as e:
             print(f"[eBay] Search exception: {e}")
@@ -891,6 +893,7 @@ class ArbitrageEngine:
         """Fetch eBay price with semaphore."""
         async with sem:
             try:
+                await asyncio.sleep(0.5)
                 listings = await self.ebay.search_items(query, max_results=10)
                 if listings:
                     best = min(listings, key=lambda x: x["total_gbp"])

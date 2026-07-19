@@ -144,16 +144,24 @@ class PokeWalletClient:
             return []
 
     async def get_set_cards(self, set_id: str) -> list[dict]:
-        try:
-            resp = await self.client.get(
-                f"{self.base_url}/sets/{set_id}/cards", headers=self.headers, timeout=30
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data if isinstance(data, list) else data.get("data", data.get("cards", []))
-        except Exception as e:
-            print(f"[PokeWallet] Error fetching cards for set {set_id}: {e}")
-            return []
+        # Try multiple endpoint patterns
+        endpoints = [
+            f"{self.base_url}/sets/{set_id}/cards",
+            f"{self.base_url}/cards?set={set_id}",
+            f"{self.base_url}/cards?set.id={set_id}",
+        ]
+        for url in endpoints:
+            try:
+                resp = await self.client.get(url, headers=self.headers, timeout=30)
+                print(f"[PokeWallet] GET {url.replace(self.base_url, '')} -> {resp.status_code}")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    items = data if isinstance(data, list) else data.get("data", data.get("cards", []))
+                    if items:
+                        return items
+            except Exception as e:
+                print(f"[PokeWallet] Error: {e}")
+        return []
 
     async def search_card(self, name: str, set_name: str = "") -> list[dict]:
         params = {"q": name}
@@ -269,6 +277,26 @@ class EbayUKScraper:
         if match:
             return float(match.group(1).replace(",", ""))
         return 0.0
+
+
+# --- Date Parser ---
+
+def _parse_date(s: dict) -> str:
+    """Parse dates like '9th September, 2022' into sortable '2022-09-09' format."""
+    from datetime import datetime
+    raw = s.get("releaseDate") or s.get("release_date") or ""
+    if not raw:
+        return "0000-00-00"
+    try:
+        # Try ISO format first (2022-09-09)
+        if re.match(r"\d{4}-\d{2}-\d{2}", raw):
+            return raw[:10]
+        # Parse "9th September, 2022" style
+        cleaned = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", raw)
+        dt = datetime.strptime(cleaned.strip(), "%d %B, %Y")
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return "0000-00-00"
 
 
 # --- Arbitrage Calculator ---
@@ -488,14 +516,14 @@ class ArbitrageEngine:
         sets = await self.pokewallet.get_sets()
         if not sets:
             return "❌ Set listesi alınamadı."
-        # En yeni setler önce (son çıkanlar daha kolay satılır)
-        sets_sorted = sorted(sets, key=lambda s: s.get("releaseDate") or s.get("release_date") or "", reverse=True)
+        # En yeni setler önce
+        sets_sorted = sorted(sets, key=lambda s: _parse_date(s), reverse=True)
         lines = [f"📦 {len(sets)} set bulundu (en yeniden eskiye):\n"]
         for i, s in enumerate(sets_sorted[:20], 1):
             name = s.get("name", "?")
             sid = s.get("id", s.get("set_id", ""))
             total = s.get("total", s.get("totalCards", "?"))
-            date = s.get("releaseDate", s.get("release_date", ""))
+            date = s.get("releaseDate") or s.get("release_date") or ""
             lines.append(f"{i}. [{sid}] {name} ({total} kart) {date}")
         if len(sets) > 20:
             lines.append(f"\n...ve {len(sets) - 20} set daha")
@@ -735,7 +763,7 @@ async def auto_scan_loop(engine: ArbitrageEngine):
             # If no watchlist, scan latest sets
             if not sets_to_scan:
                 all_sets = await engine.pokewallet.get_sets()
-                sorted_sets = sorted(all_sets, key=lambda s: s.get("releaseDate") or s.get("release_date") or "", reverse=True)
+                sorted_sets = sorted(all_sets, key=lambda s: _parse_date(s), reverse=True)
                 sets_to_scan = [s.get("id", s.get("set_id", "")) for s in sorted_sets[:AUTO_SCAN_SET_COUNT]]
 
             print(f"[AutoScan] Taranacak setler: {sets_to_scan}")
@@ -809,7 +837,7 @@ async def run_cli():
         elif command == "scan":
             limit = int(sys.argv[2]) if len(sys.argv) > 2 else 3
             sets = await engine.pokewallet.get_sets()
-            sorted_sets = sorted(sets, key=lambda s: s.get("releaseDate") or s.get("release_date") or "", reverse=True)
+            sorted_sets = sorted(sets, key=lambda s: _parse_date(s), reverse=True)
             for s in sorted_sets[:limit]:
                 sid = s.get("id", s.get("set_id", ""))
                 if sid:

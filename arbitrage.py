@@ -75,61 +75,92 @@ REQUEST_DELAY = 2
 PORT = int(os.environ.get("PORT", "10000"))
 
 
-# --- Series grouping by set_code prefix ---
+# --- Rarity filter ---
 
-# Low-value rarities to SKIP in table view (everything else is shown)
 LOW_RARITIES = {
     "common", "uncommon", "rare", "double rare",
     "promo", "normal", "trainer", "energy",
     "c", "u", "r", "rr",
 }
 
-SERIES_PREFIX_MAP = {
-    "SVP": "Scarlet & Violet",
-    "SV": "Scarlet & Violet",
-    "SWSH": "Sword & Shield",
-    "SM": "Sun & Moon",
-    "XY": "XY",
-    "BW": "Black & White",
-    "HGSS": "HeartGold & SoulSilver",
-    "PL": "Platinum",
-    "DP": "Diamond & Pearl",
-    "EX": "EX",
-    "MEW": "Scarlet & Violet",
-    "ME": "Mega Evolution",
-    "CL": "Call of Legends",
-    "NXD": "Next Destinies",
-    "LTR": "Legendary Treasures",
-    "GEN": "Generations",
-    "DET": "Detective Pikachu",
-    "CEL": "Celebrations",
-    "PGO": "Pokemon GO",
-    "TG": "Trainer Gallery",
-}
 
 def _is_high_rarity(rarity: str) -> bool:
     if not rarity:
         return False
-    r = rarity.lower().strip()
-    if r in LOW_RARITIES:
-        return False
-    for lr in LOW_RARITIES:
-        if r == lr:
-            return False
-    return True
+    return rarity.lower().strip() not in LOW_RARITIES
 
 
-def _get_series_from_code(set_code: str) -> str:
-    if not set_code:
-        return "Diğer"
-    code_upper = set_code.upper()
-    for prefix, series in sorted(SERIES_PREFIX_MAP.items(), key=lambda x: -len(x[0])):
-        if code_upper.startswith(prefix):
-            return series
-    if code_upper.startswith("PR"):
+# --- Series grouping by set NAME prefix ---
+
+SERIES_CODE_FALLBACK = {
+    "SVP": "Scarlet & Violet", "SV": "Scarlet & Violet",
+    "SWSH": "Sword & Shield", "SM": "Sun & Moon",
+    "XY": "XY", "BW": "Black & White",
+    "HGSS": "HeartGold & SoulSilver", "PL": "Platinum",
+    "DP": "Diamond & Pearl", "EX": "EX",
+    "CL": "Call of Legends", "NXD": "Next Destinies",
+    "LTR": "Legendary Treasures", "GEN": "Generations",
+    "DET": "Detective Pikachu", "CEL": "Celebrations",
+    "PGO": "Pokemon GO", "TG": "Trainer Gallery",
+}
+
+
+def _get_series_from_set(set_data: dict) -> str:
+    """Extract series from set NAME prefix (before colon).
+    PokéWallet names: 'ME03: Perfect Order', 'SV10: Destined Rivals', etc.
+    """
+    name = set_data.get("name", "")
+    name_lower = name.lower()
+
+    if ": " in name:
+        prefix = name.split(": ")[0].strip()
+        alpha = re.sub(r'[^A-Za-z]', '', prefix).upper()
+
+        if alpha in ("ME", "MEP", "MEE", "MED", "MBD", "MBG"):
+            return "Mega Evolution"
+        if alpha.startswith("SV"):
+            return "Scarlet & Violet"
+        if alpha.startswith("SWSH"):
+            return "Sword & Shield"
+        if alpha.startswith("SM"):
+            return "Sun & Moon"
+        if alpha in ("M", "ML", "MS"):
+            return "Pocket Expansion"
+        if alpha in ("A", "AA"):
+            return "Pocket Expansion"
+        if alpha.startswith("X"):
+            return "Extended Art"
+        if alpha.startswith("CBB") or alpha.startswith("CSV"):
+            return "Special Collection"
+        if alpha.startswith("PPS"):
+            return "Play! Pokemon"
+        if alpha == "TP":
+            return "Promo"
+
+    if "mega evolution" in name_lower or "mega starter" in name_lower:
+        return "Mega Evolution"
+    if any(w in name_lower for w in ("mega brave", "mega symphonia", "mega all-stars", "mega dream")):
+        return "Mega Evolution"
+    if "extended art" in name_lower:
+        return "Extended Art"
+    if "gem pack" in name_lower:
+        return "Special Collection"
+    if "promo" in name_lower or "black star" in name_lower:
         return "Promo"
-    if code_upper.startswith("MCD"):
-        return "McDonald's"
+    if "scarlet" in name_lower or "violet" in name_lower:
+        return "Scarlet & Violet"
+
+    set_code = set_data.get("set_code", "")
+    if set_code:
+        code_upper = set_code.upper()
+        for pfx, series in sorted(SERIES_CODE_FALLBACK.items(), key=lambda x: -len(x[0])):
+            if code_upper.startswith(pfx):
+                return series
+        if code_upper.startswith("PR"):
+            return "Promo"
+        if code_upper.startswith("MCD"):
+            return "McDonald's"
+
     return "Diğer"
 
 
@@ -728,8 +759,7 @@ class ArbitrageEngine:
     def _group_series(self, sets: list[dict]) -> list[tuple[str, dict]]:
         series_map = {}
         for s in sets:
-            set_code = s.get("set_code", s.get("id", ""))
-            series = _get_series_from_code(set_code)
+            series = _get_series_from_set(s)
             if series not in series_map:
                 series_map[series] = {"sets": [], "latest_date": "0000-00-00"}
             series_map[series]["sets"].append(s)
@@ -762,7 +792,7 @@ class ArbitrageEngine:
         filter_lower = series_filter.lower()
         filtered = [
             s for s in sets
-            if filter_lower in _get_series_from_code(s.get("set_code", s.get("id", ""))).lower()
+            if filter_lower in _get_series_from_set(s).lower()
         ]
         if not filtered:
             filtered = [s for s in sets if filter_lower in (s.get("name") or "").lower()]
@@ -797,7 +827,7 @@ class ArbitrageEngine:
             filter_lower = series_filter.lower()
             filtered = [
                 s for s in sets
-                if filter_lower in _get_series_from_code(s.get("set_code", s.get("id", ""))).lower()
+                if filter_lower in _get_series_from_set(s).lower()
             ]
             if not filtered:
                 filtered = [s for s in sets if filter_lower in (s.get("name") or "").lower()]
@@ -1274,7 +1304,7 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                         for s in sorted_by_date[:40]:
                             code = s.get("set_code", s.get("id", "?"))
                             name = s.get("name", "?")
-                            series = _get_series_from_code(code)
+                            series = _get_series_from_set(s)
                             code_lines.append(f"[{code}] {name} → {series}")
                         await engine.telegram.send_text(
                             f"🔧 2/4 Set Kodları (ilk 40):\n\n" + "\n".join(code_lines),
@@ -1283,7 +1313,22 @@ async def telegram_command_loop(engine: ArbitrageEngine):
 
                     # PokéWallet card data structure
                     d2 = []
-                    for test_code in ["SV6", "ME01", "A1"]:
+                    # Pick real set codes from the sets list
+                    test_codes = []
+                    if all_sets_data:
+                        for s in all_sets_data[:100]:
+                            sc = s.get("set_code", "")
+                            nm = s.get("name", "")
+                            if "SV" in nm[:4] and len(test_codes) < 1:
+                                test_codes.append(sc)
+                            elif "ME01" in nm[:5] and len(test_codes) < 2:
+                                test_codes.append(sc)
+                            elif "Genetic" in nm and len(test_codes) < 3:
+                                test_codes.append(sc)
+                        if not test_codes:
+                            test_codes = [all_sets_data[0].get("set_code", "")]
+
+                    for test_code in test_codes[:3]:
                         try:
                             resp = await cl.get(f"{pw_base}/sets/{test_code}", params={"page": 1, "limit": 1}, headers=pw_headers, timeout=15)
                             d2.append(f"/sets/{test_code} → {resp.status_code}")
@@ -1295,7 +1340,11 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                                     cards = data
                                 if cards:
                                     c = cards[0]
-                                    d2.append(f"  Card: {json.dumps(c, default=str)[:500]}")
+                                    d2.append(f"  Card keys: {list(c.keys())}")
+                                    cm = c.get("cardmarket", c.get("cm", {}))
+                                    d2.append(f"  CM data: {json.dumps(cm, default=str)[:400]}")
+                                    if not cm:
+                                        d2.append(f"  Full card: {json.dumps(c, default=str)[:600]}")
                         except Exception as e:
                             d2.append(f"/sets/{test_code} → ERR {e}")
                     await engine.telegram.send_text("🔧 3/4 Kart Yapısı\n\n" + "\n".join(d2), chat_id)

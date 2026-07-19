@@ -748,6 +748,8 @@ class ArbitrageEngine:
         self.telegram: Optional[TelegramBot] = None
         self.state: Optional[StateManager] = None
         self.calculator = ArbitrageCalculator()
+        self._running_task: Optional[asyncio.Task] = None
+        self._task_label: str = ""
 
     async def start(self):
         self.client = httpx.AsyncClient(follow_redirects=True, timeout=30)
@@ -853,31 +855,66 @@ class ArbitrageEngine:
         lines.append(f"\nBir seti analiz etmek için:\n/analyze <set_code>")
         return "\n".join(lines)
 
-    async def analyze_set_table(self, set_code: str) -> str:
+    async def _fetch_card_cm_price(self, card_data: dict, sem: asyncio.Semaphore):
+        """Fetch CM price for a single card via /cards/:id with semaphore."""
+        card_id = card_data.get("id", "")
+        if not card_id:
+            return 0.0, 0.0, ""
+        async with sem:
+            try:
+                resp = await self.client.get(
+                    f"{self.pokewallet.base_url}/cards/{card_id}",
+                    headers=self.pokewallet.headers, timeout=15,
+                )
+                if resp.status_code == 200:
+                    detail = resp.json()
+                    return PokeWalletClient.extract_cardmarket_price(detail)
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+        return 0.0, 0.0, ""
+
+    async def _fetch_ebay_price(self, query: str, sem: asyncio.Semaphore):
+        """Fetch eBay price with semaphore."""
+        async with sem:
+            try:
+                listings = await self.ebay.search_items(query, max_results=3)
+                if listings:
+                    best = min(listings, key=lambda x: x["total_gbp"])
+                    return best["total_gbp"]
+            except Exception:
+                pass
+        return 0.0
+
+    def cancel_running_task(self) -> bool:
+        if self._running_task and not self._running_task.done():
+            self._running_task.cancel()
+            label = self._task_label
+            self._running_task = None
+            self._task_label = ""
+            return True
+        return False
+
+    async def analyze_set_table(self, set_code: str, chat_id: str = "") -> list:
         """Fetch high-rarity cards from a set and return a price comparison table."""
         cards = await self.pokewallet.get_set_cards(set_code)
         if not cards:
-            return f"❌ {set_code}: Kart bulunamadı."
+            return [f"❌ {set_code}: Kart bulunamadı."]
 
-        # Check if set listing includes prices or if we need /cards/:id fallback
-        set_has_prices = False
-        if cards:
-            sample = cards[0]
-            cm = sample.get("cardmarket", sample.get("cm", {}))
-            cm_prices = cm.get("prices", []) if isinstance(cm, dict) else []
-            set_has_prices = bool(cm_prices)
-            print(f"[Table] {set_code}: set_has_prices={set_has_prices}")
+        sample = cards[0]
+        cm = sample.get("cardmarket", sample.get("cm", {}))
+        cm_prices = cm.get("prices", []) if isinstance(cm, dict) else []
+        set_has_prices = bool(cm_prices)
+        print(f"[Table] {set_code}: set_has_prices={set_has_prices}, total_cards={len(cards)}")
 
-        first_info = PokeWalletClient.extract_card_info(cards[0]) if cards else {}
+        first_info = PokeWalletClient.extract_card_info(cards[0])
         set_name = first_info.get("set_name", "") or set_code
 
         is_promo = "promo" in set_name.lower() or "promo" in set_code.lower()
         ebay_available = bool(EBAY_CLIENT_ID and EBAY_CLIENT_SECRET)
 
-        high_rarity_cards = []
+        filtered = []
         all_rarities = set()
-        detail_fetch_count = 0
-        MAX_DETAIL_FETCHES = 60
         for card_data in cards:
             info = PokeWalletClient.extract_card_info(card_data)
             rarity = info["rarity"]
@@ -885,58 +922,62 @@ class ArbitrageEngine:
                 all_rarities.add(rarity)
             if not is_promo and not _is_high_rarity(rarity):
                 continue
+            filtered.append((card_data, info))
 
-            cm_price, cm_trend, cm_url = PokeWalletClient.extract_cardmarket_price(card_data)
+        print(f"[Table] {set_name}: {len(filtered)} cards after filter, rarities: {all_rarities}")
 
-            if cm_price == 0 and not set_has_prices and detail_fetch_count < MAX_DETAIL_FETCHES:
-                card_id = card_data.get("id", "")
-                if card_id:
-                    try:
-                        resp = await self.client.get(
-                            f"{self.pokewallet.base_url}/cards/{card_id}",
-                            headers=self.pokewallet.headers, timeout=15,
-                        )
-                        detail_fetch_count += 1
-                        if resp.status_code == 200:
-                            detail = resp.json()
-                            cm_price, cm_trend, cm_url = PokeWalletClient.extract_cardmarket_price(detail)
-                        elif resp.status_code == 429:
-                            print(f"[Table] Rate limited at {detail_fetch_count} fetches")
-                            detail_fetch_count = MAX_DETAIL_FETCHES
-                        await asyncio.sleep(REQUEST_DELAY)
-                    except Exception:
-                        pass
-
-            high_rarity_cards.append({
-                "info": info,
-                "cm_price": cm_price,
-                "cm_trend": cm_trend,
-                "cm_url": cm_url,
-                "card_data": card_data,
-            })
-
-        print(f"[Table] {set_name}: rarities found: {all_rarities}")
-
-        if not high_rarity_cards:
+        if not filtered:
             rarity_list = ", ".join(sorted(all_rarities)) if all_rarities else "bilinmiyor"
-            return f"❌ {set_name}: Değerli kart bulunamadı.\nMevcut rarity'ler: {rarity_list}"
+            return [f"❌ {set_name}: Değerli kart bulunamadı.\nMevcut rarity'ler: {rarity_list}"]
+
+        # Phase 1: fetch CM prices in parallel (5 concurrent)
+        pw_sem = asyncio.Semaphore(5)
+        if not set_has_prices:
+            cm_tasks = [self._fetch_card_cm_price(cd, pw_sem) for cd, _ in filtered]
+            cm_results = await asyncio.gather(*cm_tasks)
+        else:
+            cm_results = [PokeWalletClient.extract_cardmarket_price(cd) for cd, _ in filtered]
+
+        high_rarity_cards = []
+        for i, (card_data, info) in enumerate(filtered):
+            cm_price, cm_trend, cm_url = cm_results[i]
+            high_rarity_cards.append({
+                "info": info, "cm_price": cm_price,
+                "cm_trend": cm_trend, "cm_url": cm_url,
+            })
 
         high_rarity_cards.sort(key=lambda x: x["cm_price"], reverse=True)
 
-        lines = [f"📊 {set_name}\n"]
+        if chat_id:
+            await self.telegram.send_text(
+                f"📊 {set_name}: {len(high_rarity_cards)} kart bulundu, eBay fiyatları alınıyor...",
+                chat_id,
+            )
 
+        # Phase 2: fetch eBay prices in parallel (3 concurrent)
+        ebay_sem = asyncio.Semaphore(3)
         rows = []
-        for entry in high_rarity_cards:
+        if ebay_available:
+            ebay_queries = []
+            for entry in high_rarity_cards:
+                info = entry["info"]
+                cn = info["name"] or "?"
+                cnum = info["card_number"] or ""
+                sc = info.get("set_code", set_code)
+                ebay_queries.append(f"Pokemon {cn} {cnum} {sc}")
+            ebay_tasks = [self._fetch_ebay_price(q, ebay_sem) for q in ebay_queries]
+            ebay_results = await asyncio.gather(*ebay_tasks)
+        else:
+            ebay_results = [0.0] * len(high_rarity_cards)
+
+        for i, entry in enumerate(high_rarity_cards):
             info = entry["info"]
-            card_name = info["name"]
-            card_number = info["card_number"]
-            set_code_short = info.get("set_code", set_code)
+            card_name = info["name"] or "?"
+            card_number = info["card_number"] or ""
             rarity = info["rarity"]
             cm_price = entry["cm_price"]
 
             short_rarity = self._short_rarity(rarity or "")
-            card_name = card_name or "?"
-            card_number = card_number or ""
             num = card_number.split("/")[0] if "/" in card_number else card_number
             num = re.sub(r'[^0-9]', '', num)
             if num and num not in card_name:
@@ -944,17 +985,8 @@ class ArbitrageEngine:
             else:
                 display_name = card_name
 
-            ebay_price_eur = 0.0
-            ebay_price_gbp = 0.0
-            if ebay_available:
-                search_query = f"Pokemon {card_name} {card_number} {set_code_short}"
-                ebay_listings = await self.ebay.search_items(search_query, max_results=3)
-                await asyncio.sleep(REQUEST_DELAY)
-
-                if ebay_listings:
-                    sorted_l = sorted(ebay_listings, key=lambda x: x["total_gbp"])
-                    ebay_price_gbp = sorted_l[0]["total_gbp"]
-                    ebay_price_eur = ebay_price_gbp * GBP_TO_EUR
+            ebay_price_gbp = ebay_results[i]
+            ebay_price_eur = ebay_price_gbp * GBP_TO_EUR
 
             cm_str = f"€{cm_price:.1f}" if cm_price > 0 else "—"
             ebay_str = f"£{ebay_price_gbp:.1f}" if ebay_price_gbp > 0 else "—"
@@ -970,12 +1002,13 @@ class ArbitrageEngine:
             rows.append((display_name, short_rarity, cm_str, ebay_str, profit_str))
 
         NW = 22
+        title = f"📊 {set_name}\n"
         hdr = f"{'Kart':<{NW}} {'R':<4} {'CM':>6} {'eBay':>6} {'Fark':>8}"
         sep = "─" * len(hdr)
 
         messages = []
         chunk_rows = []
-        chunk_len = len(lines[0]) + len(hdr) + len(sep) + 20
+        chunk_len = len(title) + len(hdr) + len(sep) + 20
 
         for name, rar, cm_s, eb_s, pr_s in rows:
             esc_name = html_mod.escape(name)
@@ -985,7 +1018,7 @@ class ArbitrageEngine:
             if chunk_len + len(row_line) + 10 > 3800 and chunk_rows:
                 table = "<pre>" + "\n".join([hdr, sep] + chunk_rows) + "</pre>"
                 if not messages:
-                    messages.append(lines[0] + table)
+                    messages.append(title + table)
                 else:
                     messages.append(table)
                 chunk_rows = []
@@ -996,7 +1029,7 @@ class ArbitrageEngine:
         if chunk_rows:
             table = "<pre>" + "\n".join([hdr, sep] + chunk_rows) + "</pre>"
             if not messages:
-                messages.append(lines[0] + table)
+                messages.append(title + table)
             else:
                 messages.append(table)
 
@@ -1256,18 +1289,31 @@ async def telegram_command_loop(engine: ArbitrageEngine):
 
                         elif cb_data.startswith("analyze:"):
                             set_code = cb_data[8:]
-                            await engine.telegram.send_text(f"🔍 {set_code} — değerli kartlar taranıyor...", cb_chat_id)
-                            try:
-                                messages = await asyncio.wait_for(
-                                    engine.analyze_set_table(set_code), timeout=300,
+                            if engine._running_task and not engine._running_task.done():
+                                await engine.telegram.send_text(
+                                    f"⏳ Zaten {engine._task_label} taranıyor. Durdurmak için /stop yaz.",
+                                    cb_chat_id,
                                 )
-                            except asyncio.TimeoutError:
-                                await engine.telegram.send_text(f"⏰ {set_code} — zaman aşımı (5dk). Çok fazla kart olabilir.", cb_chat_id)
                                 continue
-                            if isinstance(messages, str):
-                                messages = [messages]
-                            for msg in messages:
-                                await engine.telegram.send_html(msg, cb_chat_id)
+                            await engine.telegram.send_text(f"🔍 {set_code} — değerli kartlar taranıyor...", cb_chat_id)
+
+                            async def _run_analysis(sc=set_code, cid=cb_chat_id):
+                                try:
+                                    messages = await engine.analyze_set_table(sc, chat_id=cid)
+                                    if isinstance(messages, str):
+                                        messages = [messages]
+                                    for msg in messages:
+                                        await engine.telegram.send_html(msg, cid)
+                                except asyncio.CancelledError:
+                                    await engine.telegram.send_text(f"🛑 {sc} — tarama durduruldu.", cid)
+                                except Exception as e:
+                                    await engine.telegram.send_text(f"❌ {sc} — Hata: {e}", cid)
+                                finally:
+                                    engine._running_task = None
+                                    engine._task_label = ""
+
+                            engine._task_label = set_code
+                            engine._running_task = asyncio.create_task(_run_analysis())
                     except Exception as e:
                         print(f"[Bot] Callback error: {e}")
                         await engine.telegram.send_text(f"❌ Hata: {e}", cb_chat_id)
@@ -1281,7 +1327,13 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                 if chat_id != TELEGRAM_CHAT_ID:
                     continue
 
-                if text.startswith("/series"):
+                if text.startswith("/stop"):
+                    if engine.cancel_running_task():
+                        await engine.telegram.send_text("🛑 Tarama durduruldu.", chat_id)
+                    else:
+                        await engine.telegram.send_text("ℹ️ Şu an çalışan tarama yok.", chat_id)
+
+                elif text.startswith("/series"):
                     title, buttons = await engine.list_series_buttons()
                     if buttons:
                         await engine.telegram.send_inline_keyboard(title, buttons, chat_id)
@@ -1441,6 +1493,7 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                         "/analyze <set_code> - Set analiz et\n"
                         "/check <kart adı> - Tek kart kontrol\n"
                         "/results - En kârlı kartlar\n"
+                        "/stop - Çalışan taramayı durdur\n"
                         "/status - Bot durumu\n"
                         "/diag - Tanılama testi\n"
                         "/help - Bu mesaj\n\n"

@@ -1104,43 +1104,68 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                 elif text.startswith("/diag"):
                     await engine.telegram.send_text("🔧 Tanılama çalışıyor...", chat_id)
                     diag_lines = []
+                    cl = engine.client
+                    pw_headers = engine.pokewallet.headers
+                    pw_base = engine.pokewallet.base_url
 
-                    # Test 1: pokemontcg.io card search
+                    # Test 1: PokéWallet /sets — first set structure
                     try:
-                        results = await engine.pokewallet.search_card("Charizard ex")
-                        if results:
-                            card = results[0]
-                            cm = card.get("cardmarket", {}).get("prices", {})
-                            diag_lines.append(f"✅ pokemontcg.io: {len(results)} kart bulundu")
-                            diag_lines.append(f"   İlk kart: {card.get('name')} - CM trend: €{cm.get('trendPrice', '?')}")
-                        else:
-                            diag_lines.append("❌ pokemontcg.io: Kart bulunamadı")
+                        resp = await cl.get(f"{pw_base}/sets", headers=pw_headers, timeout=30)
+                        diag_lines.append(f"PW /sets: HTTP {resp.status_code}")
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            items = data if isinstance(data, list) else data.get("data", data.get("sets", []))
+                            diag_lines.append(f"  {len(items)} set")
+                            if items:
+                                s = items[0]
+                                diag_lines.append(f"  Keys: {list(s.keys())}")
+                                diag_lines.append(f"  Sample: {json.dumps(s, default=str)[:300]}")
                     except Exception as e:
-                        diag_lines.append(f"❌ pokemontcg.io hata: {e}")
+                        diag_lines.append(f"PW /sets hata: {e}")
 
-                    # Test 2: eBay UK search
+                    await engine.telegram.send_text("🔧 PokéWallet Sets\n\n" + "\n".join(diag_lines), chat_id)
+                    diag_lines = []
+
+                    # Test 2: PokéWallet card endpoints — try many patterns
+                    test_endpoints = [
+                        f"{pw_base}/cards?q=name:Charizard",
+                        f"{pw_base}/cards?name=Charizard",
+                        f"{pw_base}/cards/search?q=Charizard",
+                        f"{pw_base}/search?q=Charizard",
+                        f"{pw_base}/card?name=Charizard",
+                        f"{pw_base}/sets/sv6/cards",
+                        f"{pw_base}/sets/sv6",
+                        f"{pw_base}/cards?set=sv6",
+                        f"{pw_base}/cards?set.id=sv6",
+                    ]
+                    for ep in test_endpoints:
+                        try:
+                            resp = await cl.get(ep, headers=pw_headers, timeout=15)
+                            short = ep.replace(pw_base, "")
+                            status = resp.status_code
+                            body = ""
+                            if status == 200:
+                                body = resp.text[:150]
+                            diag_lines.append(f"{short} → {status} {body[:100]}")
+                        except Exception as e:
+                            diag_lines.append(f"{ep.replace(pw_base,'')} → ERR {e}")
+
+                    await engine.telegram.send_text("🔧 PokéWallet Endpoints\n\n" + "\n".join(diag_lines), chat_id)
+                    diag_lines = []
+
+                    # Test 3: eBay
                     try:
                         listings = await engine.ebay.search_sold_listings("Pokemon Charizard ex", max_results=3)
                         if listings:
-                            diag_lines.append(f"✅ eBay UK: {len(listings)} satış bulundu")
+                            diag_lines.append(f"✅ eBay sold: {len(listings)} sonuç")
                             for l in listings[:2]:
-                                diag_lines.append(f"   £{l['total_gbp']:.2f} - {l['title'][:40]}")
+                                diag_lines.append(f"  £{l['total_gbp']:.2f} - {l['title'][:40]}")
                         else:
-                            diag_lines.append("❌ eBay UK: Sonuç bulunamadı (CAPTCHA/blok olabilir)")
+                            diag_lines.append("❌ eBay sold: 0 sonuç (CAPTCHA/blok)")
                     except Exception as e:
-                        diag_lines.append(f"❌ eBay UK hata: {e}")
+                        diag_lines.append(f"❌ eBay hata: {e}")
 
-                    # Test 3: eBay BIN search
-                    try:
-                        listings = await engine.ebay.search_buy_it_now("Pokemon Charizard ex", max_results=3)
-                        if listings:
-                            diag_lines.append(f"✅ eBay BIN: {len(listings)} ilan bulundu")
-                        else:
-                            diag_lines.append("❌ eBay BIN: Sonuç bulunamadı")
-                    except Exception as e:
-                        diag_lines.append(f"❌ eBay BIN hata: {e}")
-
-                    await engine.telegram.send_text("🔧 TANIMLAMA SONUÇLARI\n\n" + "\n".join(diag_lines), chat_id)
+                    await engine.telegram.send_text("🔧 eBay Test\n\n" + "\n".join(diag_lines), chat_id)
 
                 elif text.startswith("/help"):
                     await engine.telegram.send_text(

@@ -870,29 +870,23 @@ class ArbitrageEngine:
                     ebay_price_eur = ebay_price_gbp * GBP_TO_EUR
 
             if ebay_price_eur > 0:
-                diff = cm_price - ebay_price_eur
                 calc = self.calculator.calculate(ebay_price_gbp, cm_price)
                 profit = calc["profit_eur"]
-                if profit >= MIN_PROFIT_EUR and calc["profit_percent"] >= MIN_PROFIT_PERCENT:
-                    icon = "🟢"
-                elif profit > 0:
-                    icon = "🟡"
-                else:
-                    icon = "🔴"
+                profit_icon = "🟢" if profit > 0 else "🔴"
                 lines.append(
-                    f"{icon} {display_name:<18} {short_rarity:<5} "
+                    f"{display_name:<18} {short_rarity:<5} "
                     f"€{cm_price:>5.1f}  £{ebay_price_gbp:>5.1f}  "
-                    f"€{profit:>+5.1f}"
+                    f"{profit_icon} €{profit:>+.1f}"
                 )
             else:
                 lines.append(
-                    f"⚪ {display_name:<18} {short_rarity:<5} "
+                    f"{display_name:<18} {short_rarity:<5} "
                     f"€{cm_price:>5.1f}  {'—':>6}  {'—':>6}"
                 )
 
         total_shown = min(len(high_rarity_cards), 25)
         lines.append(f"\n📈 {total_shown} kart gösteriliyor")
-        lines.append("🟢 Kârlı | 🟡 Az kârlı | 🔴 Zarar | ⚪ eBay yok")
+        lines.append("🟢 CM'de satınca kâr | 🔴 Zarar")
 
         if not ebay_available:
             lines.append("\n⚠️ eBay API ayarlanmamış — sadece CM fiyatları gösteriliyor")

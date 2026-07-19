@@ -9,6 +9,7 @@ Runs as a background service on Render (free tier).
 
 import asyncio
 import base64
+import html as html_mod
 import json
 import os
 import re
@@ -584,6 +585,9 @@ class TelegramBot:
     async def send_text(self, text: str, chat_id: str = ""):
         await self._send_message(text, parse_mode=None, chat_id=chat_id)
 
+    async def send_html(self, text: str, chat_id: str = ""):
+        await self._send_message(text, parse_mode="HTML", chat_id=chat_id)
+
     async def send_inline_keyboard(self, text: str, buttons: list[list[dict]], chat_id: str = ""):
         if not self.token:
             return
@@ -855,43 +859,14 @@ class ArbitrageEngine:
         if not cards:
             return f"❌ {set_code}: Kart bulunamadı."
 
-        # Debug: check if set listing has prices, try /cards/:id as fallback
-        debug_lines = []
+        # Check if set listing includes prices or if we need /cards/:id fallback
         set_has_prices = False
         if cards:
             sample = cards[0]
             cm = sample.get("cardmarket", sample.get("cm", {}))
             cm_prices = cm.get("prices", []) if isinstance(cm, dict) else []
             set_has_prices = bool(cm_prices)
-            debug_lines.append(f"Set prices: {'YES' if set_has_prices else 'EMPTY'}")
-
-            # If set listing has empty prices, try /cards/:id for a high-rarity sample
-            if not set_has_prices:
-                test_card = None
-                for c in cards:
-                    ci = PokeWalletClient.extract_card_info(c)
-                    if _is_high_rarity(ci.get("rarity", "")):
-                        test_card = c
-                        break
-                test_card = test_card or cards[0]
-                card_id = test_card.get("id", "")
-                if card_id:
-                    try:
-                        resp = await self.client.get(
-                            f"{self.pokewallet.base_url}/cards/{card_id}",
-                            headers=self.pokewallet.headers, timeout=15,
-                        )
-                        if resp.status_code == 200:
-                            detail = resp.json()
-                            d_cm = detail.get("cardmarket", detail.get("cm", {}))
-                            d_prices = d_cm.get("prices", []) if isinstance(d_cm, dict) else []
-                            debug_lines.append(f"/cards/{card_id[:25]} → prices: {json.dumps(d_prices, default=str)[:300]}")
-                            if d_prices:
-                                debug_lines.append("✅ /cards/:id HAS prices!")
-                        else:
-                            debug_lines.append(f"/cards/ → {resp.status_code}")
-                    except Exception as e:
-                        debug_lines.append(f"/cards/ → ERR {e}")
+            print(f"[Table] {set_code}: set_has_prices={set_has_prices}")
 
         first_info = PokeWalletClient.extract_card_info(cards[0]) if cards else {}
         set_name = first_info.get("set_name", "") or set_code
@@ -942,10 +917,9 @@ class ArbitrageEngine:
 
         high_rarity_cards.sort(key=lambda x: x["cm_price"], reverse=True)
 
-        lines = [f"📊 {set_name} — Değerli Kartlar\n"]
-        lines.append(f"{'Kart':<20} {'Rarity':<5} {'CM':>7} {'eBay':>7} {'Fark':>8}")
-        lines.append("─" * 52)
+        lines = [f"📊 {set_name}\n"]
 
+        rows = []
         for entry in high_rarity_cards[:25]:
             info = entry["info"]
             card_name = info["name"]
@@ -954,7 +928,8 @@ class ArbitrageEngine:
             cm_price = entry["cm_price"]
 
             short_rarity = self._short_rarity(rarity)
-            display_name = f"{card_name[:17]}" if len(card_name) > 17 else card_name
+            num = card_number.split("/")[0] if "/" in card_number else card_number
+            display_name = f"{card_name} {num}"
 
             ebay_price_eur = 0.0
             ebay_price_gbp = 0.0
@@ -969,37 +944,38 @@ class ArbitrageEngine:
                     ebay_price_eur = ebay_price_gbp * GBP_TO_EUR
 
             cm_str = f"€{cm_price:.1f}" if cm_price > 0 else "—"
+            ebay_str = f"£{ebay_price_gbp:.1f}" if ebay_price_gbp > 0 else "—"
 
             if ebay_price_eur > 0 and cm_price > 0:
                 calc = self.calculator.calculate(ebay_price_gbp, cm_price)
                 profit = calc["profit_eur"]
-                profit_icon = "🟢" if profit > 0 else "🔴"
-                lines.append(
-                    f"{display_name:<18} {short_rarity:<5} "
-                    f"{cm_str:>6}  £{ebay_price_gbp:.1f}  "
-                    f"{profit_icon} €{profit:>+.1f}"
-                )
-            elif ebay_price_eur > 0:
-                lines.append(
-                    f"{display_name:<18} {short_rarity:<5} "
-                    f"{'—':>6}  £{ebay_price_gbp:.1f}  {'—':>6}"
-                )
+                icon = "🟢" if profit > 0 else "🔴"
+                profit_str = f"{icon}€{profit:+.1f}"
             else:
-                lines.append(
-                    f"{display_name:<18} {short_rarity:<5} "
-                    f"{cm_str:>6}  {'—':>6}  {'—':>6}"
-                )
+                profit_str = "—"
 
-        total_shown = min(len(high_rarity_cards), 25)
-        lines.append(f"\n📈 {total_shown} kart gösteriliyor")
-        lines.append("🟢 CM'de satınca kâr | 🔴 Zarar")
+            rows.append((display_name, short_rarity, cm_str, ebay_str, profit_str))
+
+        NW = 22
+        table_lines = []
+        hdr = f"{'Kart':<{NW}} {'R':<4} {'CM':>6} {'eBay':>6} {'Fark':>8}"
+        table_lines.append(hdr)
+        table_lines.append("─" * len(hdr))
+        for name, rar, cm_s, eb_s, pr_s in rows:
+            esc_name = html_mod.escape(name)
+            if len(esc_name) > NW:
+                esc_name = esc_name[:NW-1] + "…"
+            table_lines.append(
+                f"{esc_name:<{NW}} {rar:<4} {cm_s:>6} {eb_s:>6} {pr_s:>8}"
+            )
+
+        total_shown = len(rows)
+        lines.append("<pre>" + "\n".join(table_lines) + "</pre>")
+        lines.append(f"\n📈 {total_shown} kart")
+        lines.append("🟢 CM kârlı │ 🔴 Zararlı")
 
         if not ebay_available:
-            lines.append("\n⚠️ eBay API ayarlanmamış — sadece CM fiyatları gösteriliyor")
-
-        if debug_lines:
-            lines.append("\n🔧 Debug:")
-            lines.extend(debug_lines)
+            lines.append("\n⚠️ eBay API ayarlanmamış")
 
         return "\n".join(lines)
 
@@ -1253,7 +1229,7 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                             set_code = cb_data[8:]
                             await engine.telegram.send_text(f"🔍 {set_code} — değerli kartlar taranıyor...", cb_chat_id)
                             table = await engine.analyze_set_table(set_code)
-                            await engine.telegram.send_text(table, cb_chat_id)
+                            await engine.telegram.send_html(table, cb_chat_id)
                     except Exception as e:
                         print(f"[Bot] Callback error: {e}")
                         await engine.telegram.send_text(f"❌ Hata: {e}", cb_chat_id)

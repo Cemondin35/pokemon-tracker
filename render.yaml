@@ -1,12 +1,24 @@
 services:
   - type: web
-    name: pokemon-tracker
+    name: pokemon-arbitrage
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python tracker.py
+    startCommand: python arbitrage.py serve
     plan: free
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: POKEWALLET_API_KEY
+        sync: false
+      - key: GBP_TO_EUR
+        value: "1.17"
+      - key: MIN_PROFIT_EUR
+        value: "2.0"
+      - key: MIN_PROFIT_PERCENT
+        value: "15.0"
+      - key: AUTO_SCAN_INTERVAL_HOURS
+        value: "6"
+      - key: WATCHLIST_SETS
         sync: false

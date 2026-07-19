@@ -1,1 +1,1 @@
-worker: python tracker.py
+web: python arbitrage.py serve

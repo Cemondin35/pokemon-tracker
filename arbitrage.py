@@ -855,74 +855,43 @@ class ArbitrageEngine:
         if not cards:
             return f"❌ {set_code}: Kart bulunamadı."
 
-        # Debug: show card structure in first message
+        # Debug: check if set listing has prices, try /cards/:id as fallback
         debug_lines = []
+        set_has_prices = False
         if cards:
             sample = cards[0]
-            debug_lines.append(f"Card keys: {list(sample.keys())}")
-            cm = sample.get("cardmarket", sample.get("cm", None))
-            tcg = sample.get("tcgplayer", sample.get("tcg", None))
-            prices = sample.get("prices", None)
-            if cm:
-                debug_lines.append(f"CM: {json.dumps(cm, default=str)[:300]}")
-            if tcg:
-                debug_lines.append(f"TCG: {json.dumps(tcg, default=str)[:200]}")
-            if prices:
-                debug_lines.append(f"Prices: {json.dumps(prices, default=str)[:300]}")
-            if not cm and not tcg and not prices:
-                debug_lines.append("⚠️ cardmarket/tcgplayer/prices alanı YOK")
-                debug_lines.append(f"Tüm veri: {json.dumps(sample, default=str)[:500]}")
+            cm = sample.get("cardmarket", sample.get("cm", {}))
+            cm_prices = cm.get("prices", []) if isinstance(cm, dict) else []
+            set_has_prices = bool(cm_prices)
+            debug_lines.append(f"Set prices: {'YES' if set_has_prices else 'EMPTY'}")
 
-            # Try /cards/:id for first card to see if it has prices
-            card_id = sample.get("id", "")
-            if card_id and not cm:
-                try:
-                    resp = await self.client.get(
-                        f"{self.pokewallet.base_url}/cards/{card_id}",
-                        headers=self.pokewallet.headers, timeout=15,
-                    )
-                    if resp.status_code == 200:
-                        detail = resp.json()
-                        detail_cm = detail.get("cardmarket", detail.get("cm", None))
-                        debug_lines.append(f"\n/cards/{card_id[:20]}... → 200")
-                        debug_lines.append(f"Detail keys: {list(detail.keys())}")
-                        if detail_cm:
-                            debug_lines.append(f"Detail CM: {json.dumps(detail_cm, default=str)[:300]}")
+            # If set listing has empty prices, try /cards/:id for a high-rarity sample
+            if not set_has_prices:
+                test_card = None
+                for c in cards:
+                    ci = PokeWalletClient.extract_card_info(c)
+                    if _is_high_rarity(ci.get("rarity", "")):
+                        test_card = c
+                        break
+                test_card = test_card or cards[0]
+                card_id = test_card.get("id", "")
+                if card_id:
+                    try:
+                        resp = await self.client.get(
+                            f"{self.pokewallet.base_url}/cards/{card_id}",
+                            headers=self.pokewallet.headers, timeout=15,
+                        )
+                        if resp.status_code == 200:
+                            detail = resp.json()
+                            d_cm = detail.get("cardmarket", detail.get("cm", {}))
+                            d_prices = d_cm.get("prices", []) if isinstance(d_cm, dict) else []
+                            debug_lines.append(f"/cards/{card_id[:25]} → prices: {json.dumps(d_prices, default=str)[:300]}")
+                            if d_prices:
+                                debug_lines.append("✅ /cards/:id HAS prices!")
                         else:
-                            debug_lines.append(f"Detail data: {json.dumps(detail, default=str)[:400]}")
-                    else:
-                        debug_lines.append(f"\n/cards/{card_id[:20]}... → {resp.status_code}")
-                except Exception as e:
-                    debug_lines.append(f"/cards/ → ERR {e}")
-
-            # Try /search endpoint too
-            sample_info = PokeWalletClient.extract_card_info(sample)
-            search_name = sample_info.get("name", "")
-            if search_name and not cm:
-                try:
-                    resp = await self.client.get(
-                        f"{self.pokewallet.base_url}/search",
-                        params={"q": search_name},
-                        headers=self.pokewallet.headers, timeout=15,
-                    )
-                    if resp.status_code == 200:
-                        sdata = resp.json()
-                        results = sdata if isinstance(sdata, list) else sdata.get("data", sdata.get("cards", []))
-                        if results and isinstance(results, list) and len(results) > 0:
-                            sr = results[0]
-                            sr_cm = sr.get("cardmarket", sr.get("cm", None))
-                            debug_lines.append(f"\n/search?q={search_name[:15]} → {len(results)} results")
-                            debug_lines.append(f"Search keys: {list(sr.keys())}")
-                            if sr_cm:
-                                debug_lines.append(f"Search CM: {json.dumps(sr_cm, default=str)[:300]}")
-                            else:
-                                debug_lines.append(f"Search data: {json.dumps(sr, default=str)[:400]}")
-                        else:
-                            debug_lines.append(f"/search?q={search_name[:15]} → empty ({type(sdata).__name__})")
-                    else:
-                        debug_lines.append(f"/search → {resp.status_code}")
-                except Exception as e:
-                    debug_lines.append(f"/search → ERR {e}")
+                            debug_lines.append(f"/cards/ → {resp.status_code}")
+                    except Exception as e:
+                        debug_lines.append(f"/cards/ → ERR {e}")
 
         first_info = PokeWalletClient.extract_card_info(cards[0]) if cards else {}
         set_name = first_info.get("set_name", "") or set_code
@@ -940,6 +909,22 @@ class ArbitrageEngine:
                 continue
 
             cm_price, cm_trend, cm_url = PokeWalletClient.extract_cardmarket_price(card_data)
+
+            # If set listing has no prices, fetch individual card detail
+            if cm_price == 0 and not set_has_prices:
+                card_id = card_data.get("id", "")
+                if card_id:
+                    try:
+                        resp = await self.client.get(
+                            f"{self.pokewallet.base_url}/cards/{card_id}",
+                            headers=self.pokewallet.headers, timeout=15,
+                        )
+                        if resp.status_code == 200:
+                            detail = resp.json()
+                            cm_price, cm_trend, cm_url = PokeWalletClient.extract_cardmarket_price(detail)
+                        await asyncio.sleep(REQUEST_DELAY)
+                    except Exception:
+                        pass
 
             high_rarity_cards.append({
                 "info": info,

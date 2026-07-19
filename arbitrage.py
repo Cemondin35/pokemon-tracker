@@ -982,8 +982,10 @@ class ArbitrageEngine:
                 info = entry["info"]
                 cn = info["name"] or "?"
                 cnum = info["card_number"] or ""
-                sc = info.get("set_code", set_code)
-                ebay_queries.append(f"Pokemon {cn} {cnum} {sc}")
+                num_only = cnum.split("/")[0].strip() if "/" in cnum else cnum.strip()
+                num_only = re.sub(r'[^0-9]', '', num_only)
+                q = f"Pokemon {cn} {num_only}" if num_only else f"Pokemon {cn}"
+                ebay_queries.append(q)
             ebay_tasks = [self._fetch_ebay_price(q, ebay_sem) for q in ebay_queries]
             ebay_results = await asyncio.gather(*ebay_tasks)
         else:

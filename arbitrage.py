@@ -468,9 +468,9 @@ class EbayBrowseAPI:
             return []
 
     EBAY_SKIP_KEYWORDS = {
-        "psa", "cgc", "bgs", "graded", "grade", "slab",
-        "sealed", "booster", "box", "case", "bundle", "lot",
-        "bulk", "collection", "display", "etb", "tin",
+        "psa ", "cgc ", "bgs ", " graded", " slab",
+        "sealed booster", "booster box", " etb ",
+        " bulk ", "job lot",
     }
 
     def _normalize_items(self, items: list[dict]) -> list[dict]:
@@ -891,7 +891,7 @@ class ArbitrageEngine:
         """Fetch eBay price with semaphore."""
         async with sem:
             try:
-                listings = await self.ebay.search_items(query, max_results=5)
+                listings = await self.ebay.search_items(query, max_results=10)
                 if listings:
                     best = min(listings, key=lambda x: x["total_gbp"])
                     return best["total_gbp"]

@@ -3,35 +3,31 @@
 Pokemon Card Arbitrage System
 Buy from eBay UK → Sell on Cardmarket for profit.
 
-Runs as a background service on Render (free tier):
-- Automatically scans sets every few hours
-- Responds to Telegram bot commands (/sets, /analyze, /check, /results)
-- Sends photo notifications for profitable cards
+Uses PokéWallet API for Cardmarket prices and eBay Browse API for UK prices.
+Runs as a background service on Render (free tier).
 """
 
 import asyncio
+import base64
 import json
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-# Force unbuffered output for Render logs
 os.environ["PYTHONUNBUFFERED"] = "1"
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 import httpx
-from bs4 import BeautifulSoup
 
 
 # --- Load .env file ---
 
 def load_env():
-    """Load variables from .env file if it exists."""
     env_path = Path(__file__).parent / ".env"
     if env_path.exists():
         for line in env_path.read_text().splitlines():
@@ -48,48 +44,79 @@ load_env()
 # --- Configuration ---
 
 POKEWALLET_API_BASE = "https://api.pokewallet.io"
-EBAY_UK_BASE = "https://www.ebay.co.uk"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# Cardmarket fees: 5% commission + ~1.5€ shipping average
 CARDMARKET_COMMISSION_PERCENT = 5.0
 CARDMARKET_SHIPPING_COST_EUR = 1.50
 
-# GBP to EUR conversion rate
 GBP_TO_EUR = float(os.environ.get("GBP_TO_EUR", "1.17"))
 
-# Minimum profit thresholds
 MIN_PROFIT_EUR = float(os.environ.get("MIN_PROFIT_EUR", "2.0"))
 MIN_PROFIT_PERCENT = float(os.environ.get("MIN_PROFIT_PERCENT", "15.0"))
 
-# PokéWallet API key (free tier: 100 req/hour, 1000/day)
 POKEWALLET_API_KEY = os.environ.get("POKEWALLET_API_KEY", "")
 
-# Auto-scan settings
+EBAY_CLIENT_ID = os.environ.get("EBAY_CLIENT_ID", "")
+EBAY_CLIENT_SECRET = os.environ.get("EBAY_CLIENT_SECRET", "")
+EBAY_ENVIRONMENT = os.environ.get("EBAY_ENVIRONMENT", "PRODUCTION")
+
 AUTO_SCAN_INTERVAL_HOURS = int(os.environ.get("AUTO_SCAN_INTERVAL_HOURS", "6"))
 AUTO_SCAN_SET_COUNT = int(os.environ.get("AUTO_SCAN_SET_COUNT", "3"))
 
-# Watchlist: comma-separated set IDs to auto-scan
 WATCHLIST_SETS = [s.strip() for s in os.environ.get("WATCHLIST_SETS", "").split(",") if s.strip()]
 
-# State files
 STATE_FILE = "arbitrage_state.json"
 RESULTS_FILE = "arbitrage_results.json"
 
-# Rate limiting
 REQUEST_DELAY = 2
 
-# Health check port (Render needs this)
 PORT = int(os.environ.get("PORT", "10000"))
+
+
+# --- Series grouping by set_code prefix ---
+
+SERIES_PREFIX_MAP = {
+    "SV": "Scarlet & Violet",
+    "SWSH": "Sword & Shield",
+    "SM": "Sun & Moon",
+    "XY": "XY",
+    "BW": "Black & White",
+    "HGSS": "HeartGold & SoulSilver",
+    "PL": "Platinum",
+    "DP": "Diamond & Pearl",
+    "EX": "EX",
+    "ME": "Mega Evolution",
+    "CL": "Call of Legends",
+    "NXD": "Next Destinies",
+    "LTR": "Legendary Treasures",
+    "GEN": "Generations",
+    "DET": "Detective Pikachu",
+    "CEL": "Celebrations",
+    "PGO": "Pokemon GO",
+    "TG": "Trainer Gallery",
+}
+
+def _get_series_from_code(set_code: str) -> str:
+    if not set_code:
+        return "Diğer"
+    code_upper = set_code.upper()
+    for prefix, series in sorted(SERIES_PREFIX_MAP.items(), key=lambda x: -len(x[0])):
+        if code_upper.startswith(prefix):
+            return series
+    if code_upper.startswith("PR"):
+        return "Promo"
+    if code_upper.startswith("MCD"):
+        return "McDonald's"
+    return "Diğer"
 
 
 @dataclass
 class CardPrice:
     name: str
     set_name: str
-    set_id: str
+    set_code: str
     card_number: str
     rarity: str = ""
     image_url: str = ""
@@ -110,13 +137,35 @@ class CardPrice:
 
 @dataclass
 class SetInfo:
-    id: str
+    set_code: str
     name: str
     series: str = ""
     total_cards: int = 0
 
 
-# --- PokéWallet API Client (Cardmarket Prices) ---
+# --- Date Parser ---
+
+def _parse_date(s: dict) -> str:
+    from datetime import datetime
+    raw = s.get("releaseDate") or s.get("release_date") or ""
+    if not raw:
+        return "0000-00-00"
+    try:
+        if re.match(r"\d{4}[-/]\d{2}[-/]\d{2}", raw):
+            return raw[:10].replace("/", "-")
+        cleaned = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", raw)
+        for fmt in ["%d %B, %Y", "%d %B %Y", "%B %d, %Y", "%B %d %Y"]:
+            try:
+                dt = datetime.strptime(cleaned.strip(), fmt)
+                return dt.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    return "0000-00-00"
+
+
+# --- PokéWallet API Client ---
 
 class PokeWalletClient:
     def __init__(self, client: httpx.AsyncClient):
@@ -129,272 +178,270 @@ class PokeWalletClient:
         self._sets_cache_time: float = 0
 
     async def get_sets(self) -> list[dict]:
-        # Return cached data if fresh (5 minutes)
         if self._sets_cache and (time.time() - self._sets_cache_time) < 300:
             return self._sets_cache
 
-        # Use pokemontcg.io as primary — it has series, proper IDs, releaseDate
-        try:
-            page = 1
-            all_sets = []
-            while True:
-                resp = await self.client.get(
-                    f"https://api.pokemontcg.io/v2/sets?orderBy=-releaseDate&page={page}&pageSize=250",
-                    headers={}, timeout=30,
-                )
-                print(f"[ptcg] GET /sets page={page} -> {resp.status_code}")
-                if resp.status_code != 200:
-                    break
-                data = resp.json()
-                items = data.get("data", [])
-                if not items:
-                    break
-                all_sets.extend(items)
-                if len(items) < 250:
-                    break
-                page += 1
-            if all_sets:
-                print(f"[ptcg] Total sets: {len(all_sets)}")
-                self._sets_cache = all_sets
-                self._sets_cache_time = time.time()
-                return all_sets
-        except Exception as e:
-            print(f"[ptcg] Sets error: {e}")
-
-        # Fallback to PokéWallet
         try:
             resp = await self.client.get(
                 f"{self.base_url}/sets", headers=self.headers, timeout=30
             )
-            print(f"[PokeWallet] GET /sets -> {resp.status_code}")
+            print(f"[PW] GET /sets -> {resp.status_code}")
             resp.raise_for_status()
             data = resp.json()
             items = data if isinstance(data, list) else data.get("data", data.get("sets", []))
             self._sets_cache = items
             self._sets_cache_time = time.time()
+            print(f"[PW] Total sets: {len(items)}")
             return items
         except Exception as e:
-            print(f"[PokeWallet] Error fetching sets: {e}")
+            print(f"[PW] Error fetching sets: {e}")
             return []
 
-    async def get_set_cards(self, set_id: str, set_name: str = "") -> list[dict]:
-        # pokemontcg.io first (since our sets listing uses ptcg IDs)
+    async def get_set_cards(self, set_code: str) -> list[dict]:
         all_cards = []
         page = 1
-        try:
-            while True:
-                url = f"https://api.pokemontcg.io/v2/cards?q=set.id:{set_id}&select=name,number,rarity,images,set,cardmarket&pageSize=250&page={page}"
-                resp = await self.client.get(url, headers={}, timeout=30)
-                print(f"[ptcg] cards set.id:{set_id} page={page} -> {resp.status_code}")
-                if resp.status_code == 200:
-                    items = resp.json().get("data", [])
-                    if items:
-                        all_cards.extend(items)
-                        if len(items) < 250:
-                            break
-                        page += 1
-                        continue
+        while True:
+            try:
+                resp = await self.client.get(
+                    f"{self.base_url}/sets/{set_code}",
+                    params={"page": page, "limit": 50},
+                    headers=self.headers,
+                    timeout=30,
+                )
+                print(f"[PW] GET /sets/{set_code}?page={page} -> {resp.status_code}")
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                cards = data.get("cards", data.get("data", []))
+                if isinstance(data, list):
+                    cards = data
+                if not cards:
+                    break
+                all_cards.extend(cards)
+                total = data.get("total_cards", data.get("total", 0))
+                if total and len(all_cards) >= total:
+                    break
+                if len(cards) < 50:
+                    break
+                page += 1
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                print(f"[PW] Error fetching cards for {set_code} page {page}: {e}")
                 break
-        except Exception as e:
-            print(f"[ptcg] Cards error: {e}")
 
-        if all_cards:
-            print(f"[ptcg] Total cards for {set_id}: {len(all_cards)}")
-            return all_cards
+        print(f"[PW] Total cards for {set_code}: {len(all_cards)}")
+        return all_cards
 
-        # Fallback: search by set name
-        if set_name:
-            try:
-                url = f"https://api.pokemontcg.io/v2/cards?q=set.name:\"{set_name}\"&select=name,number,rarity,images,set,cardmarket&pageSize=250"
-                resp = await self.client.get(url, headers={}, timeout=30)
-                print(f"[ptcg] cards by name '{set_name}' -> {resp.status_code}")
-                if resp.status_code == 200:
-                    items = resp.json().get("data", [])
-                    if items:
-                        print(f"[ptcg] Found {len(items)} cards by name")
-                        return items
-            except Exception as e:
-                print(f"[ptcg] Name search error: {e}")
-
-        # Last fallback: PokéWallet
-        for url in [
-            f"{self.base_url}/cards?q=set.id:{set_id}",
-            f"{self.base_url}/sets/{set_id}/cards",
-        ]:
-            try:
-                resp = await self.client.get(url, headers=self.headers, timeout=30)
-                print(f"[PW] {url.replace(self.base_url, '')} -> {resp.status_code}")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    items = data if isinstance(data, list) else data.get("data", data.get("cards", []))
-                    if items:
-                        return items
-            except Exception as e:
-                print(f"[PW] Error: {e}")
-
-        print(f"[API] No cards found for set {set_id}")
-        return []
-
-    async def search_card(self, name: str, set_name: str = "") -> list[dict]:
-        # pokemontcg.io first (better data, free, no key)
-        try:
-            url = f"https://api.pokemontcg.io/v2/cards?q=name:\"{name}\"&select=name,number,rarity,images,set,cardmarket&pageSize=10"
-            resp = await self.client.get(url, headers={}, timeout=30)
-            print(f"[ptcg] Search '{name}' -> {resp.status_code}")
-            if resp.status_code == 200:
-                items = resp.json().get("data", [])
-                if items:
-                    print(f"[ptcg] Found {len(items)} results")
-                    return items
-        except Exception as e:
-            print(f"[ptcg] Search error: {e}")
-
-        # Fallback: PokéWallet
-        for url in [
-            f"{self.base_url}/cards?q=name:{name}",
-            f"{self.base_url}/cards?q={name}",
-        ]:
-            try:
-                resp = await self.client.get(url, headers=self.headers, timeout=30)
-                print(f"[PW] Search '{name}' -> {resp.status_code}")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    items = data if isinstance(data, list) else data.get("data", data.get("cards", []))
-                    if items:
-                        return items
-            except Exception as e:
-                print(f"[PW] Search error: {e}")
-        return []
-
-
-# --- eBay UK Scraper ---
-
-class EbayUKScraper:
-    def __init__(self, client: httpx.AsyncClient):
-        self.client = client
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-GB,en;q=0.9",
-        }
-
-    async def search_sold_listings(self, query: str, max_results: int = 10) -> list[dict]:
-        params = {
-            "_nkw": query,
-            "_sacat": "183454",
-            "LH_Sold": "1",
-            "LH_Complete": "1",
-            "_sop": "15",
-            "LH_PrefLoc": "1",
-        }
-        return await self._search(params, max_results)
-
-    async def search_buy_it_now(self, query: str, max_results: int = 10) -> list[dict]:
-        params = {
-            "_nkw": query,
-            "_sacat": "183454",
-            "LH_BIN": "1",
-            "_sop": "15",
-            "LH_PrefLoc": "1",
-        }
-        return await self._search(params, max_results)
-
-    async def _search(self, params: dict, max_results: int) -> list[dict]:
+    async def search_card(self, query: str) -> list[dict]:
         try:
             resp = await self.client.get(
-                f"{EBAY_UK_BASE}/sch/i.html",
-                params=params,
+                f"{self.base_url}/search",
+                params={"q": query},
                 headers=self.headers,
                 timeout=30,
             )
-            print(f"[eBay] HTTP {resp.status_code}, len={len(resp.text)}")
-            resp.raise_for_status()
-            listings = self._parse_listings(resp.text, max_results)
-            if not listings and len(resp.text) > 1000:
-                # Check if eBay returned a CAPTCHA/block page
-                if "captcha" in resp.text.lower() or "robot" in resp.text.lower():
-                    print("[eBay] CAPTCHA/bot detection triggered!")
-                elif ".s-item" not in resp.text:
-                    print("[eBay] No .s-item elements found - page structure may have changed")
-                    print(f"[eBay] Page snippet: {resp.text[:300]}")
-            return listings
+            print(f"[PW] GET /search?q={query} -> {resp.status_code}")
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            results = data.get("results", data.get("data", []))
+            if isinstance(data, list):
+                results = data
+            print(f"[PW] Search '{query}': {len(results)} results")
+            return results
         except Exception as e:
-            print(f"[eBay UK] Error searching: {e}")
+            print(f"[PW] Search error: {e}")
             return []
 
-    def _parse_listings(self, html: str, max_results: int) -> list[dict]:
-        soup = BeautifulSoup(html, "lxml")
-        listings = []
+    def get_image_url(self, card_id: str, size: str = "high") -> str:
+        return f"{self.base_url}/images/{card_id}?size={size}"
 
-        items = soup.select(".s-item")
-        if not items:
-            items = soup.select("[data-viewport]")
+    @staticmethod
+    def extract_cardmarket_price(card_data: dict) -> tuple[float, float, str]:
+        """Extract Cardmarket avg and trend prices from PokéWallet card data.
+        Returns (avg_price, trend_price, product_url).
+        """
+        cm = card_data.get("cardmarket", {})
+        if not cm:
+            return 0.0, 0.0, ""
 
-        for item in items[:max_results + 1]:
+        product_url = cm.get("product_url", "")
+        prices_list = cm.get("prices", [])
+
+        if isinstance(prices_list, list):
+            for p in prices_list:
+                vtype = p.get("variant_type", "")
+                if vtype in ("normal", "holo", ""):
+                    avg = float(p.get("avg", 0) or 0)
+                    trend = float(p.get("trend", 0) or 0)
+                    low = float(p.get("low", 0) or 0)
+                    price = trend or avg or low
+                    return price, trend, product_url
+            if prices_list:
+                p = prices_list[0]
+                avg = float(p.get("avg", 0) or 0)
+                trend = float(p.get("trend", 0) or 0)
+                low = float(p.get("low", 0) or 0)
+                price = trend or avg or low
+                return price, trend, product_url
+        elif isinstance(prices_list, dict):
+            avg = float(prices_list.get("avg", 0) or prices_list.get("trendPrice", 0) or prices_list.get("averageSellPrice", 0) or 0)
+            trend = float(prices_list.get("trend", 0) or prices_list.get("trendPrice", 0) or 0)
+            return avg or trend, trend, product_url
+
+        return 0.0, 0.0, product_url
+
+    @staticmethod
+    def extract_card_info(card_data: dict) -> dict:
+        """Extract normalized card info from PokéWallet card data."""
+        ci = card_data.get("card_info", {})
+        card_id = card_data.get("id", "")
+        return {
+            "id": card_id,
+            "name": ci.get("name", card_data.get("name", "Unknown")),
+            "set_name": ci.get("set_name", card_data.get("set_name", "")),
+            "set_code": ci.get("set_code", card_data.get("set_code", "")),
+            "card_number": ci.get("card_number", card_data.get("number", card_data.get("card_number", ""))),
+            "rarity": ci.get("rarity", card_data.get("rarity", "")),
+        }
+
+
+# --- eBay Browse API Client ---
+
+class EbayBrowseAPI:
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+        self._access_token: str = ""
+        self._token_expires: float = 0
+        if EBAY_ENVIRONMENT == "SANDBOX":
+            self.auth_url = "https://api.sandbox.ebay.com/identity/v1/oauth2/token"
+            self.api_url = "https://api.sandbox.ebay.com/buy/browse/v1"
+        else:
+            self.auth_url = "https://api.ebay.com/identity/v1/oauth2/token"
+            self.api_url = "https://api.ebay.com/buy/browse/v1"
+
+    async def _get_token(self) -> str:
+        if self._access_token and time.time() < self._token_expires - 60:
+            return self._access_token
+
+        if not EBAY_CLIENT_ID or not EBAY_CLIENT_SECRET:
+            print("[eBay] No API credentials configured")
+            return ""
+
+        credentials = base64.b64encode(
+            f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}".encode()
+        ).decode()
+
+        try:
+            resp = await self.client.post(
+                self.auth_url,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Authorization": f"Basic {credentials}",
+                },
+                data={
+                    "grant_type": "client_credentials",
+                    "scope": "https://api.ebay.com/oauth/api_scope",
+                },
+                timeout=15,
+            )
+            print(f"[eBay] OAuth token -> {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                self._access_token = data["access_token"]
+                self._token_expires = time.time() + data.get("expires_in", 7200)
+                return self._access_token
+            else:
+                print(f"[eBay] OAuth error: {resp.text[:300]}")
+                return ""
+        except Exception as e:
+            print(f"[eBay] OAuth exception: {e}")
+            return ""
+
+    async def search_items(self, query: str, max_results: int = 10) -> list[dict]:
+        token = await self._get_token()
+        if not token:
+            return []
+
+        try:
+            params = {
+                "q": query,
+                "category_ids": "183454",
+                "filter": "buyingOptions:{FIXED_PRICE},itemLocationCountry:GB",
+                "sort": "newlyListed",
+                "limit": str(min(max_results, 50)),
+            }
+            resp = await self.client.get(
+                f"{self.api_url}/item_summary/search",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-EBAY-C-MARKETPLACE-ID": "EBAY_GB",
+                    "X-EBAY-C-ENDUSERCTX": "contextualLocation=country=GB",
+                },
+                timeout=30,
+            )
+            print(f"[eBay] Search '{query[:40]}' -> {resp.status_code}")
+
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("itemSummaries", [])
+                return self._normalize_items(items)
+            elif resp.status_code == 429:
+                print("[eBay] Rate limited - waiting")
+                await asyncio.sleep(5)
+                return []
+            else:
+                print(f"[eBay] Search error: {resp.text[:300]}")
+                return []
+        except Exception as e:
+            print(f"[eBay] Search exception: {e}")
+            return []
+
+    def _normalize_items(self, items: list[dict]) -> list[dict]:
+        results = []
+        for item in items:
             try:
-                title_el = item.select_one(".s-item__title")
-                if not title_el:
-                    continue
-                title = title_el.get_text(strip=True)
-                if title.lower() == "shop on ebay":
-                    continue
+                price_data = item.get("price", {})
+                price_str = price_data.get("value", "0")
+                currency = price_data.get("currency", "GBP")
+                price = float(price_str)
 
-                price_el = item.select_one(".s-item__price")
-                price_text = price_el.get_text(strip=True) if price_el else "0"
-                price = self._parse_price(price_text)
+                shipping = 0.0
+                ship_opts = item.get("shippingOptions", [])
+                if ship_opts:
+                    ship_cost = ship_opts[0].get("shippingCost", {})
+                    shipping = float(ship_cost.get("value", "0"))
 
-                shipping_el = item.select_one(".s-item__shipping, .s-item__freeXDays")
-                shipping_text = shipping_el.get_text(strip=True) if shipping_el else "0"
-                shipping = self._parse_price(shipping_text) if "free" not in shipping_text.lower() else 0.0
-
-                link_el = item.select_one(".s-item__link")
-                url = link_el["href"] if link_el else ""
-
-                img_el = item.select_one(".s-item__image-wrapper img")
                 image_url = ""
-                if img_el:
-                    image_url = img_el.get("src", "") or img_el.get("data-src", "")
+                img = item.get("image", {})
+                if img:
+                    image_url = img.get("imageUrl", "")
+                thumbnails = item.get("thumbnailImages", [])
+                if not image_url and thumbnails:
+                    image_url = thumbnails[0].get("imageUrl", "")
 
-                condition_el = item.select_one(".SECONDARY_INFO")
-                condition = condition_el.get_text(strip=True) if condition_el else ""
+                condition = item.get("condition", "")
+                if isinstance(condition, dict):
+                    condition = condition.get("conditionDisplayName", "")
+
+                item_url = item.get("itemWebUrl", item.get("itemHref", ""))
 
                 if price > 0:
-                    listings.append({
-                        "title": title,
+                    results.append({
+                        "title": item.get("title", ""),
                         "price_gbp": price,
                         "shipping_gbp": shipping,
                         "total_gbp": price + shipping,
-                        "url": url,
+                        "url": item_url,
                         "image_url": image_url,
                         "condition": condition,
+                        "currency": currency,
+                        "item_id": item.get("itemId", ""),
                     })
             except Exception:
                 continue
-
-        return listings[:max_results]
-
-    def _parse_price(self, text: str) -> float:
-        match = re.search(r"£([\d,]+\.?\d*)", text)
-        if match:
-            return float(match.group(1).replace(",", ""))
-        return 0.0
-
-
-# --- Date Parser ---
-
-def _parse_date(s: dict) -> str:
-    """Parse various date formats into sortable 'YYYY-MM-DD'."""
-    from datetime import datetime
-    raw = s.get("releaseDate") or s.get("release_date") or ""
-    if not raw:
-        return "0000-00-00"
-    try:
-        if re.match(r"\d{4}[-/]\d{2}[-/]\d{2}", raw):
-            return raw[:10].replace("/", "-")
-        cleaned = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", raw)
-        dt = datetime.strptime(cleaned.strip(), "%d %B, %Y")
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return "0000-00-00"
+        return results
 
 
 # --- Arbitrage Calculator ---
@@ -417,7 +464,7 @@ class ArbitrageCalculator:
         }
 
 
-# --- Telegram Bot (send + receive commands) ---
+# --- Telegram Bot ---
 
 class TelegramBot:
     def __init__(self, client: httpx.AsyncClient):
@@ -500,7 +547,6 @@ class TelegramBot:
             pass
 
     async def get_updates(self) -> list[dict]:
-        """Poll for new Telegram messages and callback queries."""
         if not self.token:
             return []
         try:
@@ -581,8 +627,8 @@ class StateManager:
         with open(RESULTS_FILE, "w") as f:
             json.dump(self.results, f, indent=2, default=str)
 
-    def mark_set_analyzed(self, set_id: str, set_name: str, profitable_count: int):
-        self.state["analyzed_sets"][set_id] = {
+    def mark_set_analyzed(self, set_code: str, set_name: str, profitable_count: int):
+        self.state["analyzed_sets"][set_code] = {
             "name": set_name,
             "profitable_count": profitable_count,
             "last_checked": time.strftime("%Y-%m-%d %H:%M"),
@@ -610,8 +656,8 @@ class StateManager:
         cards = self.results.get("profitable_cards", [])
         return sorted(cards, key=lambda c: c.get("profit_eur", 0), reverse=True)[:limit]
 
-    def is_set_recent(self, set_id: str, hours: int = 24) -> bool:
-        info = self.state.get("analyzed_sets", {}).get(set_id)
+    def is_set_recent(self, set_code: str, hours: int = 24) -> bool:
+        info = self.state.get("analyzed_sets", {}).get(set_code)
         if not info:
             return False
         try:
@@ -628,7 +674,7 @@ class ArbitrageEngine:
     def __init__(self):
         self.client: Optional[httpx.AsyncClient] = None
         self.pokewallet: Optional[PokeWalletClient] = None
-        self.ebay: Optional[EbayUKScraper] = None
+        self.ebay: Optional[EbayBrowseAPI] = None
         self.telegram: Optional[TelegramBot] = None
         self.state: Optional[StateManager] = None
         self.calculator = ArbitrageCalculator()
@@ -636,7 +682,7 @@ class ArbitrageEngine:
     async def start(self):
         self.client = httpx.AsyncClient(follow_redirects=True, timeout=30)
         self.pokewallet = PokeWalletClient(self.client)
-        self.ebay = EbayUKScraper(self.client)
+        self.ebay = EbayBrowseAPI(self.client)
         self.telegram = TelegramBot(self.client)
         self.state = StateManager()
 
@@ -644,37 +690,11 @@ class ArbitrageEngine:
         if self.client:
             await self.client.aclose()
 
-    @staticmethod
-    def _normalize_series(series: str) -> str:
-        """Merge promo/sub-series into their parent series."""
-        s = series.strip()
-        # Map sub-series to parent
-        merges = {
-            "Scarlet & Violet": ["Scarlet & Violet"],
-            "Sword & Shield": ["Sword & Shield"],
-            "Sun & Moon": ["Sun & Moon"],
-            "XY": ["XY"],
-            "Black & White": ["Black & White"],
-            "Mega Evolution": ["Mega Evolution"],
-            "HeartGold & SoulSilver": ["HeartGold & SoulSilver", "HGSS"],
-            "Diamond & Pearl": ["Diamond & Pearl"],
-            "EX": ["EX"],
-            "Platinum": ["Platinum"],
-            "Neo": ["Neo"],
-            "Base": ["Base"],
-        }
-        for parent, prefixes in merges.items():
-            for prefix in prefixes:
-                if s.startswith(prefix):
-                    return parent
-        return s
-
     def _group_series(self, sets: list[dict]) -> list[tuple[str, dict]]:
-        """Group sets by series, sorted newest first."""
         series_map = {}
         for s in sets:
-            raw_series = s.get("series") or s.get("set_series") or "Other"
-            series = self._normalize_series(raw_series)
+            set_code = s.get("set_code", s.get("id", ""))
+            series = _get_series_from_code(set_code)
             if series not in series_map:
                 series_map[series] = {"sets": [], "latest_date": "0000-00-00"}
             series_map[series]["sets"].append(s)
@@ -683,23 +703,7 @@ class ArbitrageEngine:
                 series_map[series]["latest_date"] = d
         return sorted(series_map.items(), key=lambda x: x[1]["latest_date"], reverse=True)
 
-    async def list_series(self) -> str:
-        """List all series/eras (newest first)."""
-        sets = await self.pokewallet.get_sets()
-        if not sets:
-            return "❌ Seri listesi alınamadı."
-
-        sorted_series = self._group_series(sets)
-
-        lines = ["📚 SERİLER (en yeniden eskiye):\n"]
-        for i, (name, info) in enumerate(sorted_series, 1):
-            count = len(info["sets"])
-            lines.append(f"{i}. {name} ({count} set)")
-        lines.append(f"\nBir serinin setlerini görmek için:\n/sets <seri adı>\nÖrn: /sets Scarlet & Violet")
-        return "\n".join(lines)
-
     async def list_series_buttons(self) -> tuple[str, list[list[dict]]]:
-        """Return series as inline keyboard buttons."""
         sets = await self.pokewallet.get_sets()
         if not sets:
             return "❌ Seri listesi alınamadı.", []
@@ -710,24 +714,20 @@ class ArbitrageEngine:
         for name, info in sorted_series[:20]:
             count = len(info["sets"])
             btn_text = f"{name} ({count})"
-            # Truncate callback data to 64 bytes (Telegram limit)
             cb_data = f"series:{name[:50]}"
             buttons.append([{"text": btn_text, "callback_data": cb_data}])
 
         return "📚 Bir seri seçin:", buttons
 
     async def list_sets_buttons(self, series_filter: str) -> tuple[str, list[list[dict]]]:
-        """Return sets in a series as inline keyboard buttons."""
         sets = await self.pokewallet.get_sets()
         if not sets:
             return "❌ Set listesi alınamadı.", []
 
         filter_lower = series_filter.lower()
-        # Match by normalized series name or raw series name
         filtered = [
             s for s in sets
-            if filter_lower in self._normalize_series(s.get("series") or s.get("set_series") or "").lower()
-            or filter_lower in (s.get("series") or s.get("set_series") or "").lower()
+            if filter_lower in _get_series_from_code(s.get("set_code", s.get("id", ""))).lower()
         ]
         if not filtered:
             filtered = [s for s in sets if filter_lower in (s.get("name") or "").lower()]
@@ -739,27 +739,24 @@ class ArbitrageEngine:
         buttons = []
         for s in sets_sorted[:30]:
             name = s.get("name", "?")
-            sid = s.get("id", s.get("set_id", ""))
-            total = s.get("total", s.get("totalCards", "?"))
+            set_code = s.get("set_code", s.get("id", ""))
+            total = s.get("card_count", s.get("total", "?"))
             btn_text = f"{name} ({total} kart)"
-            cb_data = f"analyze:{sid}"
+            cb_data = f"analyze:{set_code}"
             buttons.append([{"text": btn_text, "callback_data": cb_data}])
 
         return f"📦 {series_filter} ({len(sets_sorted)} set):", buttons
 
     async def list_sets(self, series_filter: str = "") -> str:
-        """List sets, optionally filtered by series."""
         sets = await self.pokewallet.get_sets()
         if not sets:
             return "❌ Set listesi alınamadı."
 
-        # Filter by series if provided
         if series_filter:
             filter_lower = series_filter.lower()
             filtered = [
                 s for s in sets
-                if filter_lower in self._normalize_series(s.get("series") or s.get("set_series") or "").lower()
-                or filter_lower in (s.get("series") or s.get("set_series") or "").lower()
+                if filter_lower in _get_series_from_code(s.get("set_code", s.get("id", ""))).lower()
             ]
             if not filtered:
                 filtered = [s for s in sets if filter_lower in (s.get("name") or "").lower()]
@@ -767,103 +764,80 @@ class ArbitrageEngine:
                 return f"❌ '{series_filter}' serisi bulunamadı. /series ile serileri listele."
             sets = filtered
 
-        # En yeni setler önce
         sets_sorted = sorted(sets, key=lambda s: _parse_date(s), reverse=True)
         title = f"📦 {series_filter}" if series_filter else "📦 Tüm setler"
         lines = [f"{title} ({len(sets)} set, en yeniden eskiye):\n"]
         for i, s in enumerate(sets_sorted[:25], 1):
             name = s.get("name", "?")
-            sid = s.get("id", s.get("set_id", ""))
-            total = s.get("total", s.get("totalCards", "?"))
-            date = s.get("releaseDate") or s.get("release_date") or ""
-            lines.append(f"{i}. [{sid}] {name} ({total} kart) {date}")
+            set_code = s.get("set_code", s.get("id", ""))
+            total = s.get("card_count", s.get("total", "?"))
+            date = s.get("release_date") or s.get("releaseDate") or ""
+            lines.append(f"{i}. [{set_code}] {name} ({total} kart) {date}")
         if len(sets) > 25:
             lines.append(f"\n...ve {len(sets) - 25} set daha")
-        lines.append(f"\nBir seti analiz etmek için:\n/analyze <set_id>")
+        lines.append(f"\nBir seti analiz etmek için:\n/analyze <set_code>")
         return "\n".join(lines)
 
-    async def analyze_set(self, set_id: str, force: bool = False) -> list[CardPrice]:
-        if not force and self.state.is_set_recent(set_id):
+    async def analyze_set(self, set_code: str, force: bool = False) -> list[CardPrice]:
+        if not force and self.state.is_set_recent(set_code):
             return []
 
-        # Try to get set name from the sets list for better fallback search
-        set_name_hint = ""
-        all_sets = await self.pokewallet.get_sets()
-        for s in all_sets:
-            sid = s.get("id", s.get("set_id", ""))
-            if str(sid) == str(set_id):
-                set_name_hint = s.get("name", "")
-                break
-
-        cards = await self.pokewallet.get_set_cards(set_id, set_name=set_name_hint)
+        cards = await self.pokewallet.get_set_cards(set_code)
         if not cards:
-            print(f"[Analyze] No cards returned for {set_id}")
+            print(f"[Analyze] No cards returned for {set_code}")
             return []
 
-        set_name = cards[0].get("set", {}).get("name", set_name_hint or set_id) if cards else set_id
+        first_info = PokeWalletClient.extract_card_info(cards[0]) if cards else {}
+        set_name = first_info.get("set_name", "") or set_code
         profitable = []
 
-        # Stats for debugging
         total_cards = len(cards)
         cards_with_cm_price = 0
         cards_checked_ebay = 0
         cards_found_ebay = 0
-        ebay_failed = False
+        ebay_available = bool(EBAY_CLIENT_ID and EBAY_CLIENT_SECRET)
 
-        print(f"[Analyze] {set_name} ({set_id}): {total_cards} cards total")
+        print(f"[Analyze] {set_name} ({set_code}): {total_cards} cards, eBay API: {'yes' if ebay_available else 'no credentials'}")
 
-        # Sample first card to check data structure
         if cards:
             sample = cards[0]
-            cm_sample = sample.get("cardmarket", {})
             print(f"[Analyze] Sample card keys: {list(sample.keys())}")
-            print(f"[Analyze] Sample cardmarket: {json.dumps(cm_sample, default=str)[:300]}")
+            cm_sample = sample.get("cardmarket", {})
+            print(f"[Analyze] Sample cardmarket: {json.dumps(cm_sample, default=str)[:400]}")
 
         for card_data in cards:
-            card_name = card_data.get("name", "Unknown")
-            card_number = card_data.get("number", card_data.get("card_number", ""))
-            rarity = card_data.get("rarity", "")
-            images = card_data.get("images", {})
-            image_url = card_data.get("image") or images.get("small") or images.get("large") or ""
+            info = PokeWalletClient.extract_card_info(card_data)
+            card_name = info["name"]
+            card_number = info["card_number"]
+            card_id = info["id"]
+            rarity = info["rarity"]
 
-            # Extract Cardmarket price
-            cardmarket_data = card_data.get("cardmarket", {})
-            prices = cardmarket_data.get("prices", card_data.get("prices", {}))
-            cardmarket_price = 0.0
-            if isinstance(prices, dict):
-                cm = prices.get("cardmarket", prices)
-                cardmarket_price = float(
-                    cm.get("trendPrice") or cm.get("averageSellPrice") or
-                    cm.get("trend") or cm.get("price") or 0
-                )
+            image_url = self.pokewallet.get_image_url(card_id) if card_id else ""
+
+            cardmarket_price, cardmarket_trend, cardmarket_url = PokeWalletClient.extract_cardmarket_price(card_data)
 
             if cardmarket_price < 1.0:
                 continue
 
             cards_with_cm_price += 1
 
-            # Only search eBay for cards worth checking (saves API calls)
-            if ebay_failed and cards_checked_ebay >= 3:
+            if not ebay_available:
                 continue
 
             search_query = f"Pokemon {card_name} {card_number} {set_name}"
-            ebay_listings = await self.ebay.search_sold_listings(search_query, max_results=5)
+            ebay_listings = await self.ebay.search_items(search_query, max_results=5)
             cards_checked_ebay += 1
             await asyncio.sleep(REQUEST_DELAY)
 
             if not ebay_listings:
-                if cards_checked_ebay <= 3 and cards_found_ebay == 0:
-                    ebay_failed = True
-                    print(f"[Analyze] eBay returned 0 results for first {cards_checked_ebay} cards - possible block")
                 continue
 
             cards_found_ebay += 1
-            ebay_failed = False
 
             sorted_listings = sorted(ebay_listings, key=lambda x: x["total_gbp"])
-            last_3 = sorted_listings[:3]
-            avg_total_gbp = sum(l["total_gbp"] for l in last_3) / len(last_3)
-            cheapest = last_3[0]
+            cheapest_3 = sorted_listings[:3]
+            avg_total_gbp = sum(l["total_gbp"] for l in cheapest_3) / len(cheapest_3)
+            cheapest = cheapest_3[0]
             calc = self.calculator.calculate(avg_total_gbp, cardmarket_price)
 
             print(f"  [{card_name} #{card_number}] CM: €{cardmarket_price:.2f} | eBay avg: £{avg_total_gbp:.2f} (€{calc['total_cost_eur']:.2f}) | Kâr: €{calc['profit_eur']:.2f} ({calc['profit_percent']:.1f}%)")
@@ -872,7 +846,7 @@ class ArbitrageEngine:
                 card_price = CardPrice(
                     name=card_name,
                     set_name=set_name,
-                    set_id=set_id,
+                    set_code=set_code,
                     card_number=str(card_number),
                     rarity=rarity,
                     image_url=image_url or cheapest.get("image_url", ""),
@@ -882,7 +856,8 @@ class ArbitrageEngine:
                     ebay_url=cheapest["url"],
                     ebay_condition=cheapest.get("condition", ""),
                     cardmarket_price_eur=cardmarket_price,
-                    cardmarket_url=f"https://www.cardmarket.com/en/Pokemon/Products/Search?searchString={card_name.replace(' ', '+')}",
+                    cardmarket_trend_eur=cardmarket_trend,
+                    cardmarket_url=cardmarket_url or f"https://www.cardmarket.com/en/Pokemon/Products/Search?searchString={card_name.replace(' ', '+')}",
                     total_cost_eur=calc["total_cost_eur"],
                     selling_price_after_fees_eur=calc["selling_price_after_fees_eur"],
                     profit_eur=calc["profit_eur"],
@@ -901,20 +876,21 @@ class ArbitrageEngine:
         )
         print(summary)
 
-        # Send diagnostic info to Telegram if no results
         if not profitable and cards_with_cm_price > 0:
             diag = f"📊 Analiz detayı:\n"
             diag += f"Toplam kart: {total_cards}\n"
             diag += f"CM fiyatı ≥€1: {cards_with_cm_price}\n"
             diag += f"eBay'de arandı: {cards_checked_ebay}\n"
             diag += f"eBay'de bulundu: {cards_found_ebay}\n"
-            if ebay_failed:
-                diag += "\n⚠️ eBay scraping başarısız - CAPTCHA/blok olabilir"
+            if not ebay_available:
+                diag += "\n⚠️ eBay API anahtarları ayarlanmamış!\nEBAY_CLIENT_ID ve EBAY_CLIENT_SECRET gerekli."
+            elif cards_found_ebay == 0 and cards_checked_ebay > 0:
+                diag += "\n⚠️ eBay'de sonuç bulunamadı"
             elif cards_found_ebay > 0:
                 diag += "\neBay fiyatları kâr eşiğini karşılamıyor"
             await self.telegram.send_text(diag)
 
-        self.state.mark_set_analyzed(set_id, set_name, len(profitable))
+        self.state.mark_set_analyzed(set_code, set_name, len(profitable))
         await self.telegram.send_set_summary(set_name, profitable)
         return profitable
 
@@ -924,45 +900,44 @@ class ArbitrageEngine:
             return f"❌ '{card_name}' bulunamadı."
 
         card_data = results[0]
-        name = card_data.get("name", card_name)
-        number = card_data.get("number", "")
-        set_info = card_data.get("set", {})
-        set_name = set_info.get("name", "")
-        images = card_data.get("images", {})
-        image_url = card_data.get("image") or images.get("small") or images.get("large") or ""
+        info = PokeWalletClient.extract_card_info(card_data)
+        name = info["name"]
+        card_number = info["card_number"]
+        set_name = info["set_name"]
+        card_id = info["id"]
 
-        cardmarket_data = card_data.get("cardmarket", {})
-        prices = cardmarket_data.get("prices", card_data.get("prices", {}))
-        cardmarket_price = 0.0
-        if isinstance(prices, dict):
-            cm = prices.get("cardmarket", prices)
-            cardmarket_price = float(
-                cm.get("trendPrice") or cm.get("averageSellPrice") or
-                cm.get("trend") or cm.get("price") or 0
-            )
+        image_url = self.pokewallet.get_image_url(card_id) if card_id else ""
+        cardmarket_price, _, cardmarket_url = PokeWalletClient.extract_cardmarket_price(card_data)
 
         if cardmarket_price < 0.5:
             return f"❌ {name}: Cardmarket fiyatı çok düşük (€{cardmarket_price:.2f})"
 
-        search_query = f"Pokemon {name} {number}"
-        ebay_listings = await self.ebay.search_sold_listings(search_query, max_results=5)
+        if not EBAY_CLIENT_ID or not EBAY_CLIENT_SECRET:
+            return (
+                f"🃏 {name} #{card_number} ({set_name})\n"
+                f"🇪🇺 Cardmarket: €{cardmarket_price:.2f}\n\n"
+                f"⚠️ eBay API anahtarları ayarlanmamış.\n"
+                f"EBAY_CLIENT_ID ve EBAY_CLIENT_SECRET gerekli."
+            )
+
+        search_query = f"Pokemon {name} {card_number}"
+        ebay_listings = await self.ebay.search_items(search_query, max_results=5)
 
         if not ebay_listings:
-            return f"❌ {name}: eBay UK sold listings'de bulunamadı."
+            return f"❌ {name}: eBay UK'de bulunamadı."
 
-        # Son 3 satışın ortalaması
         sorted_listings = sorted(ebay_listings, key=lambda x: x["total_gbp"])
-        last_3 = sorted_listings[:3]
-        avg_total_gbp = sum(l["total_gbp"] for l in last_3) / len(last_3)
-        cheapest = last_3[0]
+        cheapest_3 = sorted_listings[:3]
+        avg_total_gbp = sum(l["total_gbp"] for l in cheapest_3) / len(cheapest_3)
+        cheapest = cheapest_3[0]
         calc = self.calculator.calculate(avg_total_gbp, cardmarket_price)
 
         status = "✅ KÂRLI" if calc["is_profitable"] else "❌ Kârsız"
-        sold_info = " / ".join([f"£{l['total_gbp']:.2f}" for l in last_3])
+        prices_info = " / ".join([f"£{l['total_gbp']:.2f}" for l in cheapest_3])
         return (
             f"{status}\n\n"
-            f"🃏 {name} #{number} ({set_name})\n"
-            f"🇬🇧 eBay UK Son Satışlar: {sold_info}\n"
+            f"🃏 {name} #{card_number} ({set_name})\n"
+            f"🇬🇧 eBay UK: {prices_info}\n"
             f"🇬🇧 Ortalama: £{avg_total_gbp:.2f} (€{calc['total_cost_eur']:.2f})\n"
             f"🇪🇺 Cardmarket: €{cardmarket_price:.2f}\n"
             f"💵 Satış sonrası: €{calc['selling_price_after_fees_eur']:.2f}\n"
@@ -974,7 +949,6 @@ class ArbitrageEngine:
 # --- Background Service ---
 
 async def health_server():
-    """Simple HTTP server for Render health checks."""
     async def handle(reader, writer):
         await reader.read(1024)
         response = (
@@ -992,14 +966,12 @@ async def health_server():
 
 
 async def telegram_command_loop(engine: ArbitrageEngine):
-    """Listen for Telegram bot commands and inline button callbacks."""
     print("[Bot] Telegram komut dinleme başladı...")
 
     while True:
         try:
             updates = await engine.telegram.get_updates()
             for update in updates:
-                # Handle callback queries (inline button presses)
                 cb = update.get("callback_query")
                 if cb:
                     cb_id = cb.get("id", "")
@@ -1008,7 +980,6 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                     print(f"[Bot] Processing callback: data='{cb_data}' chat={cb_chat_id}")
 
                     if cb_chat_id != TELEGRAM_CHAT_ID:
-                        print(f"[Bot] Skipping callback: chat {cb_chat_id} != {TELEGRAM_CHAT_ID}")
                         await engine.telegram.answer_callback(cb_id)
                         continue
 
@@ -1025,18 +996,17 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                                 await engine.telegram.send_text(text, cb_chat_id)
 
                         elif cb_data.startswith("analyze:"):
-                            set_id = cb_data[8:]
-                            await engine.telegram.send_text(f"🔍 {set_id} analiz ediliyor... (bu biraz sürebilir)", cb_chat_id)
-                            profitable = await engine.analyze_set(set_id, force=True)
+                            set_code = cb_data[8:]
+                            await engine.telegram.send_text(f"🔍 {set_code} analiz ediliyor... (bu biraz sürebilir)", cb_chat_id)
+                            profitable = await engine.analyze_set(set_code, force=True)
                             if not profitable:
-                                await engine.telegram.send_text(f"❌ {set_id}: Kârlı kart bulunamadı.", cb_chat_id)
+                                await engine.telegram.send_text(f"❌ {set_code}: Kârlı kart bulunamadı.", cb_chat_id)
                     except Exception as e:
                         print(f"[Bot] Callback error: {e}")
                         await engine.telegram.send_text(f"❌ Hata: {e}", cb_chat_id)
 
                     continue
 
-                # Handle regular messages
                 msg = update.get("message", {})
                 text = msg.get("text", "").strip()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -1066,13 +1036,13 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                 elif text.startswith("/analyze"):
                     parts = text.split()
                     if len(parts) < 2:
-                        await engine.telegram.send_text("Kullanım: /analyze <set_id>", chat_id)
+                        await engine.telegram.send_text("Kullanım: /analyze <set_code>", chat_id)
                     else:
-                        set_id = parts[1]
-                        await engine.telegram.send_text(f"🔍 {set_id} analiz ediliyor...", chat_id)
-                        profitable = await engine.analyze_set(set_id, force=True)
+                        set_code = parts[1]
+                        await engine.telegram.send_text(f"🔍 {set_code} analiz ediliyor...", chat_id)
+                        profitable = await engine.analyze_set(set_code, force=True)
                         if not profitable:
-                            await engine.telegram.send_text(f"❌ {set_id}: Kârlı kart bulunamadı.", chat_id)
+                            await engine.telegram.send_text(f"❌ {set_code}: Kârlı kart bulunamadı.", chat_id)
 
                 elif text.startswith("/check"):
                     card_name = text.replace("/check", "").strip()
@@ -1097,7 +1067,7 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                         for i, c in enumerate(top, 1):
                             lines.append(
                                 f"{i}. {c['name']} ({c['set_name']})\n"
-                                f"   €{c['profit_eur']:.2f} kâr ({c['profit_percent']:.1f}%)"
+                                f"   💵 €{c['profit_eur']:.2f} kâr ({c['profit_percent']:.1f}%)"
                             )
                         await engine.telegram.send_text("\n".join(lines), chat_id)
 
@@ -1107,92 +1077,67 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                     pw_headers = engine.pokewallet.headers
                     pw_base = engine.pokewallet.base_url
 
-                    # Test 1: PokéWallet /search full result
                     d = []
+
+                    # PokéWallet /sets
                     try:
-                        resp = await cl.get(f"{pw_base}/search?q=Charizard ex", headers=pw_headers, timeout=30)
-                        d.append(f"/search?q=Charizard ex → {resp.status_code}")
+                        resp = await cl.get(f"{pw_base}/sets", headers=pw_headers, timeout=15)
+                        d.append(f"✅ PW /sets → {resp.status_code}")
                         if resp.status_code == 200:
                             data = resp.json()
-                            d.append(f"Top keys: {list(data.keys())}")
-                            results = data.get("results", data.get("data", []))
-                            d.append(f"Results count: {len(results)}")
-                            if results:
-                                r = results[0]
-                                d.append(f"Result keys: {list(r.keys())}")
-                                d.append(f"Result[0]: {json.dumps(r, default=str)[:500]}")
-                                if len(results) > 1:
-                                    d.append(f"Result[1]: {json.dumps(results[1], default=str)[:300]}")
+                            items = data if isinstance(data, list) else data.get("data", [])
+                            d.append(f"  {len(items)} set bulundu")
+                            if items:
+                                s = items[0]
+                                d.append(f"  Keys: {list(s.keys())}")
                     except Exception as e:
-                        d.append(f"Hata: {e}")
-                    await engine.telegram.send_text("🔧 PW /search\n\n" + "\n".join(d), chat_id)
+                        d.append(f"❌ PW /sets → {e}")
 
-                    # Test 2: PokéWallet /sets/SV6 full response
-                    d = []
-                    for code in ["SV6", "sv6", "SV1"]:
-                        try:
-                            resp = await cl.get(f"{pw_base}/sets/{code}", headers=pw_headers, timeout=15)
-                            d.append(f"/sets/{code} → {resp.status_code}")
-                            if resp.status_code == 200:
-                                data = resp.json()
-                                d.append(f"Keys: {list(data.keys())}")
-                                d.append(f"Data: {json.dumps(data, default=str)[:400]}")
-                        except Exception as e:
-                            d.append(f"/sets/{code} → ERR {e}")
-                    await engine.telegram.send_text("🔧 PW /sets/{code}\n\n" + "\n".join(d), chat_id)
-
-                    # Test 3: PokéWallet card detail + price endpoints
-                    d = []
+                    # PokéWallet /sets/SV6 (cards with prices)
                     try:
-                        resp = await cl.get(f"{pw_base}/search?q=Charizard ex", headers=pw_headers, timeout=30)
+                        resp = await cl.get(f"{pw_base}/sets/SV6", params={"page": 1, "limit": 2}, headers=pw_headers, timeout=15)
+                        d.append(f"\n✅ PW /sets/SV6 → {resp.status_code}")
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            d.append(f"  Keys: {list(data.keys())}")
+                            cards = data.get("cards", data.get("data", []))
+                            if cards:
+                                c = cards[0]
+                                d.append(f"  Card keys: {list(c.keys())}")
+                                cm = c.get("cardmarket", {})
+                                d.append(f"  CM: {json.dumps(cm, default=str)[:300]}")
+                    except Exception as e:
+                        d.append(f"❌ PW /sets/SV6 → {e}")
+
+                    # PokéWallet /search
+                    try:
+                        resp = await cl.get(f"{pw_base}/search", params={"q": "Charizard"}, headers=pw_headers, timeout=15)
+                        d.append(f"\n✅ PW /search?q=Charizard → {resp.status_code}")
                         if resp.status_code == 200:
                             data = resp.json()
                             results = data.get("results", data.get("data", []))
-                            if results:
-                                card_id = results[0].get("id", "")
-                                slug = results[0].get("slug", results[0].get("url", ""))
-                                d.append(f"Card ID: {card_id}")
-                                d.append(f"Slug: {slug}")
-                                # Try card detail endpoints
-                                for ep in [
-                                    f"{pw_base}/card/{card_id}",
-                                    f"{pw_base}/cards/{card_id}",
-                                    f"{pw_base}/card/{card_id}/prices",
-                                    f"{pw_base}/prices/{card_id}",
-                                    f"{pw_base}/product/{card_id}",
-                                ]:
-                                    try:
-                                        r2 = await cl.get(ep, headers=pw_headers, timeout=15)
-                                        short = ep.replace(pw_base, "")
-                                        body = r2.text[:200] if r2.status_code == 200 else ""
-                                        d.append(f"{short} → {r2.status_code} {body}")
-                                    except Exception as e2:
-                                        d.append(f"{ep.replace(pw_base,'')} → ERR")
+                            d.append(f"  {len(results)} sonuç")
                     except Exception as e:
-                        d.append(f"Hata: {e}")
-                    await engine.telegram.send_text("🔧 PW Card Detail\n\n" + "\n".join(d), chat_id)
+                        d.append(f"❌ PW /search → {e}")
 
-                    # Test 4: More PokéWallet endpoints
-                    d = []
-                    for ep in [
-                        f"{pw_base}/",
-                        f"{pw_base}/api",
-                        f"{pw_base}/docs",
-                        f"{pw_base}/v1/sets",
-                        f"{pw_base}/v2/sets",
-                        f"{pw_base}/set/SV6/cards",
-                        f"{pw_base}/set/SV6",
-                        f"{pw_base}/search?q=SV6&type=set",
-                        f"{pw_base}/sets?series=Scarlet",
-                    ]:
+                    # eBay Browse API
+                    if EBAY_CLIENT_ID and EBAY_CLIENT_SECRET:
                         try:
-                            r = await cl.get(ep, headers=pw_headers, timeout=10)
-                            short = ep.replace(pw_base, "")
-                            body = r.text[:120] if r.status_code == 200 else ""
-                            d.append(f"{short} → {r.status_code} {body[:100]}")
+                            token = await engine.ebay._get_token()
+                            if token:
+                                d.append(f"\n✅ eBay OAuth → Token alındı")
+                                items = await engine.ebay.search_items("Pokemon Charizard", max_results=2)
+                                d.append(f"✅ eBay Search → {len(items)} sonuç")
+                                if items:
+                                    d.append(f"  İlk: {items[0].get('title', '?')[:60]} £{items[0].get('total_gbp', 0):.2f}")
+                            else:
+                                d.append(f"\n❌ eBay OAuth → Token alınamadı")
                         except Exception as e:
-                            d.append(f"{ep.replace(pw_base,'')} → ERR")
-                    await engine.telegram.send_text("🔧 PW Other Endpoints\n\n" + "\n".join(d), chat_id)
+                            d.append(f"\n❌ eBay → {e}")
+                    else:
+                        d.append(f"\n⚠️ eBay API anahtarları ayarlanmamış")
+
+                    await engine.telegram.send_text("🔧 Tanılama Sonuçları:\n\n" + "\n".join(d), chat_id)
 
                 elif text.startswith("/help"):
                     await engine.telegram.send_text(
@@ -1200,7 +1145,7 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                         "/series - Serileri butonlarla listele\n"
                         "/sets - Tüm setleri listele\n"
                         "/sets <seri adı> - Serinin setlerini butonlarla göster\n"
-                        "/analyze <set_id> - Set analiz et\n"
+                        "/analyze <set_code> - Set analiz et\n"
                         "/check <kart adı> - Tek kart kontrol\n"
                         "/results - En kârlı kartlar\n"
                         "/status - Bot durumu\n"
@@ -1214,13 +1159,18 @@ async def telegram_command_loop(engine: ArbitrageEngine):
                     last_run = engine.state.state.get("last_run", "Hiç")
                     sets_done = len(engine.state.state.get("analyzed_sets", {}))
                     total_profitable = len(engine.state.results.get("profitable_cards", []))
+                    ebay_status = "✅ Ayarlandı" if (EBAY_CLIENT_ID and EBAY_CLIENT_SECRET) else "❌ Ayarlanmamış"
+                    pw_status = "✅ Ayarlandı" if POKEWALLET_API_KEY else "⚠️ API key yok"
                     await engine.telegram.send_text(
                         f"📊 Bot Durumu\n\n"
                         f"Son tarama: {last_run}\n"
                         f"Analiz edilen set: {sets_done}\n"
                         f"Bulunan kârlı kart: {total_profitable}\n"
                         f"Otomatik tarama: Her {AUTO_SCAN_INTERVAL_HOURS} saatte\n"
-                        f"Watchlist: {', '.join(WATCHLIST_SETS) or 'Yok'}",
+                        f"Watchlist: {', '.join(WATCHLIST_SETS) or 'Yok'}\n\n"
+                        f"API Durumu:\n"
+                        f"PokéWallet: {pw_status}\n"
+                        f"eBay Browse API: {ebay_status}",
                         chat_id,
                     )
 
@@ -1231,26 +1181,22 @@ async def telegram_command_loop(engine: ArbitrageEngine):
 
 
 async def auto_scan_loop(engine: ArbitrageEngine):
-    """Periodically scan watchlist sets for arbitrage opportunities."""
     print(f"[AutoScan] Her {AUTO_SCAN_INTERVAL_HOURS} saatte otomatik tarama yapılacak")
-
-    # Wait a bit on startup before first scan
     await asyncio.sleep(30)
 
     while True:
         try:
             sets_to_scan = WATCHLIST_SETS.copy()
 
-            # If no watchlist, scan latest sets
             if not sets_to_scan:
                 all_sets = await engine.pokewallet.get_sets()
                 sorted_sets = sorted(all_sets, key=lambda s: _parse_date(s), reverse=True)
-                sets_to_scan = [s.get("id", s.get("set_id", "")) for s in sorted_sets[:AUTO_SCAN_SET_COUNT]]
+                sets_to_scan = [s.get("set_code", s.get("id", "")) for s in sorted_sets[:AUTO_SCAN_SET_COUNT]]
 
             print(f"[AutoScan] Taranacak setler: {sets_to_scan}")
-            for set_id in sets_to_scan:
-                if set_id:
-                    await engine.analyze_set(set_id)
+            for set_code in sets_to_scan:
+                if set_code:
+                    await engine.analyze_set(set_code)
                     await asyncio.sleep(5)
 
         except Exception as e:
@@ -1260,20 +1206,23 @@ async def auto_scan_loop(engine: ArbitrageEngine):
 
 
 async def run_service():
-    """Run as a background service (Render/Railway/Fly)."""
     engine = ArbitrageEngine()
     await engine.start()
 
     print("🃏 Pokemon Card Arbitrage Bot başlatıldı!")
-    print(f"   Platform: Render/Railway/Fly")
+    print(f"   PokéWallet API: {'✅' if POKEWALLET_API_KEY else '⚠️ API key yok'}")
+    print(f"   eBay Browse API: {'✅' if (EBAY_CLIENT_ID and EBAY_CLIENT_SECRET) else '❌ Ayarlanmamış'}")
     print(f"   Otomatik tarama: Her {AUTO_SCAN_INTERVAL_HOURS} saat")
     print(f"   Watchlist: {WATCHLIST_SETS or 'En son setler'}")
     print(f"   Min kâr: €{MIN_PROFIT_EUR} / %{MIN_PROFIT_PERCENT}")
     print()
 
     if TELEGRAM_TOKEN:
+        ebay_status = "✅" if (EBAY_CLIENT_ID and EBAY_CLIENT_SECRET) else "❌ Ayarlanmamış"
         await engine.telegram.send_text(
             "🚀 Pokemon Arbitrage Bot başladı!\n\n"
+            f"PokéWallet: ✅\n"
+            f"eBay API: {ebay_status}\n"
             f"Otomatik tarama: Her {AUTO_SCAN_INTERVAL_HOURS} saat\n"
             "Komutlar için /help yazın."
         )
@@ -1288,7 +1237,6 @@ async def run_service():
 # --- CLI Mode ---
 
 async def run_cli():
-    """Run as CLI tool."""
     engine = ArbitrageEngine()
     await engine.start()
 
@@ -1300,13 +1248,13 @@ async def run_cli():
 
         elif command == "analyze":
             if len(sys.argv) < 3:
-                print("Kullanım: python arbitrage.py analyze <set_id> [--force]")
+                print("Kullanım: python arbitrage.py analyze <set_code> [--force]")
                 return
-            set_id = sys.argv[2]
+            set_code = sys.argv[2]
             force = "--force" in sys.argv
-            result = await engine.analyze_set(set_id, force=force)
+            result = await engine.analyze_set(set_code, force=force)
             if not result:
-                print(f"❌ '{set_id}': Kârlı kart bulunamadı (veya yakın zamanda taranmış).")
+                print(f"❌ '{set_code}': Kârlı kart bulunamadı (veya yakın zamanda taranmış).")
 
         elif command == "check":
             if len(sys.argv) < 3:
@@ -1320,9 +1268,9 @@ async def run_cli():
             sets = await engine.pokewallet.get_sets()
             sorted_sets = sorted(sets, key=lambda s: _parse_date(s), reverse=True)
             for s in sorted_sets[:limit]:
-                sid = s.get("id", s.get("set_id", ""))
-                if sid:
-                    await engine.analyze_set(sid, force=True)
+                set_code = s.get("set_code", s.get("id", ""))
+                if set_code:
+                    await engine.analyze_set(set_code, force=True)
 
         elif command == "results":
             top = engine.state.get_top_results(20)
@@ -1347,16 +1295,16 @@ def print_help():
    eBay UK → Cardmarket Kâr Sistemi
 
 MODLAR:
-  python arbitrage.py serve          Arka plan servisi başlat (Render/Railway)
+  python arbitrage.py serve          Arka plan servisi başlat (Render)
   python arbitrage.py sets           Setleri listele
-  python arbitrage.py analyze <id>   Set analiz et
+  python arbitrage.py analyze <code> Set analiz et
   python arbitrage.py check <ad>     Tek kart kontrol
   python arbitrage.py scan [N]       Son N seti tara
   python arbitrage.py results        Kârlı kartları göster
 
 ÖRNEKLER:
   python arbitrage.py serve
-  python arbitrage.py analyze sv6 --force
+  python arbitrage.py analyze SV6 --force
   python arbitrage.py check "Charizard ex"
   python arbitrage.py scan 3
 """)

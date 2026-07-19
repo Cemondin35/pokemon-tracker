@@ -16,6 +16,12 @@ services:
         sync: false
       - key: POKEWALLET_API_KEY
         sync: false
+      - key: EBAY_CLIENT_ID
+        sync: false
+      - key: EBAY_CLIENT_SECRET
+        sync: false
+      - key: EBAY_ENVIRONMENT
+        value: "PRODUCTION"
       - key: GBP_TO_EUR
         value: "1.17"
       - key: MIN_PROFIT_EUR

@@ -467,10 +467,21 @@ class EbayBrowseAPI:
             print(f"[eBay] Search exception: {e}")
             return []
 
+    EBAY_SKIP_KEYWORDS = {
+        "psa", "cgc", "bgs", "graded", "grade", "slab",
+        "sealed", "booster", "box", "case", "bundle", "lot",
+        "bulk", "collection", "display", "etb", "tin",
+    }
+
     def _normalize_items(self, items: list[dict]) -> list[dict]:
         results = []
         for item in items:
             try:
+                title = item.get("title", "")
+                title_lower = title.lower()
+                if any(kw in title_lower for kw in self.EBAY_SKIP_KEYWORDS):
+                    continue
+
                 price_data = item.get("price", {})
                 price_str = price_data.get("value", "0")
                 currency = price_data.get("currency", "GBP")
@@ -498,7 +509,7 @@ class EbayBrowseAPI:
 
                 if price > 0:
                     results.append({
-                        "title": item.get("title", ""),
+                        "title": title,
                         "price_gbp": price,
                         "shipping_gbp": shipping,
                         "total_gbp": price + shipping,
@@ -880,7 +891,7 @@ class ArbitrageEngine:
         """Fetch eBay price with semaphore."""
         async with sem:
             try:
-                listings = await self.ebay.search_items(query, max_results=3)
+                listings = await self.ebay.search_items(query, max_results=5)
                 if listings:
                     best = min(listings, key=lambda x: x["total_gbp"])
                     return best["total_gbp"]
@@ -995,33 +1006,35 @@ class ArbitrageEngine:
             ebay_price_gbp = ebay_results[i]
             ebay_price_eur = ebay_price_gbp * GBP_TO_EUR
 
-            cm_str = f"€{cm_price:.0f}" if cm_price > 0 else "—"
-            ebay_str = f"€{ebay_price_eur:.0f}" if ebay_price_eur > 0 else "—"
+            cm_str = f"{cm_price:.0f}" if cm_price > 0 else "-"
+            ebay_str = f"{ebay_price_eur:.0f}" if ebay_price_eur > 0 else "-"
 
             if ebay_price_eur > 0 and cm_price > 0:
                 calc = self.calculator.calculate(ebay_price_gbp, cm_price)
                 profit = calc["profit_eur"]
-                icon = "🟢" if profit > 0 else "🔴"
-                profit_str = f"{icon}€{profit:+.0f}"
+                icon = "+" if profit > 0 else ""
+                profit_str = f"{icon}{profit:.0f}"
+                profitable = profit > 0
             else:
-                profit_str = "—"
+                profit_str = "-"
+                profitable = None
 
-            rows.append((display_name, short_rarity, cm_str, ebay_str, profit_str))
+            rows.append((display_name, short_rarity, cm_str, ebay_str, profit_str, profitable))
 
-        NW = 22
+        NW = 18
         title = f"📊 {set_name}\n"
-        hdr = f"{'Kart':<{NW}} {'R':<4} {'CM€':>6} {'eB€':>6} {'Kâr':>8}"
-        sep = "─" * len(hdr)
+        hdr = f"{'Kart':<{NW}}|{'R':^5}|{'CM':^5}|{'eB':^5}|{'Kâr':^6}"
+        sep = "-" * NW + "+" + "-" * 5 + "+" + "-" * 5 + "+" + "-" * 5 + "+" + "-" * 6
 
         messages = []
         chunk_rows = []
         chunk_len = len(title) + len(hdr) + len(sep) + 20
 
-        for name, rar, cm_s, eb_s, pr_s in rows:
+        for name, rar, cm_s, eb_s, pr_s, profitable in rows:
             esc_name = html_mod.escape(name)
             if len(esc_name) > NW:
-                esc_name = esc_name[:NW-1] + "…"
-            row_line = f"{esc_name:<{NW}} {rar:<4} {cm_s:>6} {eb_s:>6} {pr_s:>8}"
+                esc_name = esc_name[:NW - 1] + "…"
+            row_line = f"{esc_name:<{NW}}|{rar:^5}|{cm_s:>4} |{eb_s:>4} |{pr_s:>5} "
             if chunk_len + len(row_line) + 10 > 3800 and chunk_rows:
                 table = "<pre>" + "\n".join([hdr, sep] + chunk_rows) + "</pre>"
                 if not messages:
@@ -1041,7 +1054,11 @@ class ArbitrageEngine:
                 messages.append(table)
 
         total_shown = len(rows)
-        footer = f"\n📈 {total_shown} kart (£→€ ×{GBP_TO_EUR})\n🟢 CM kârlı │ 🔴 Zararlı\nCM€=Cardmarket │ eB€=eBay(EUR)"
+        green = sum(1 for *_, p in rows if p is True)
+        footer = f"\n📈 {total_shown} kart"
+        if green:
+            footer += f" | 🟢 {green} kârlı"
+        footer += f"\n£→€ ×{GBP_TO_EUR} | CM %5+€1.50 kesinti"
         if not ebay_available:
             footer += "\n\n⚠️ eBay API ayarlanmamış"
         messages[-1] += footer
